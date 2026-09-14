@@ -68,6 +68,30 @@ def gaze_command(px, py):
     return ("T %d %d\n" % (int(px), int(py))).encode()
 
 
+TRUTHY = frozenset({"true", "1", "yes", "on"})
+FALSEY = frozenset({"false", "0", "no", "off"})
+
+
+def parse_enable(value):
+    """The /eyes ``enable`` argument -> True/False, or ValueError.
+
+    A missing argument means enable (the documented default).  The test used to
+    be ``value.lower() == 'true'``, so ``enable=1`` — the most natural thing to
+    type, and the form a slider or a checkbox sends — silently turned the eyes
+    *off* at HTTP 200, and a bare ``enable=`` did the same.  Saying what you
+    mean now means that, and anything unrecognised is rejected out loud instead
+    of becoming the opposite of what was asked.
+    """
+    if value is None:
+        return True
+    want = str(value).strip().lower()
+    if want in TRUTHY:
+        return True
+    if want in FALSEY:
+        return False
+    raise ValueError("enable must be true/false (1/0, yes/no and on/off also work)")
+
+
 def nearest_obstacle(scan, max_mm, min_mm=MIN_OBSTACLE_MM):
     """Closest valid reading inside ``max_mm`` -> (distance_mm, bearing_deg).
 
@@ -116,11 +140,11 @@ class EyeGazer:
                  link=None, detector=None, clock=time.time):
         self.base = base
         self.cvf = cvf
-        self.prox_mm = float(prox_mm)
-        self.close_mm = float(close_mm)
         self.hz = max(0.5, float(hz))
-        self.cam_hz = max(0.0, float(cam_hz))       # 0 = LIDAR only
         self.hold_s = max(0.0, float(hold_s))
+        # One owner for these three: the same validation /eyes retunes through,
+        # so a NaN cannot get in through either door.
+        self.retune(prox_mm=prox_mm, close_mm=close_mm, cam_hz=cam_hz)
         self.conf = float(conf)
         self.screen_fov_deg = float(screen_fov_deg)
         self.model_path = self._resolve_model(model, root)
@@ -156,6 +180,40 @@ class EyeGazer:
         self._sent = 0
         self._errors = 0
         self._last_step_t = 0.0
+
+    # ── live tuning ──────────────────────────────────────────────────────────
+    def retune(self, prox_mm=None, close_mm=None, cam_hz=None):
+        """Change the gaze distances / camera rate.  ValueError if unusable.
+
+        Validates everything before assigning any of it, so a rejected retune
+        leaves the running policy exactly as it was — the endpoint used to
+        assign as it parsed, so a 400 still left half the change applied.
+
+        The finiteness check is the one that matters: ``float('nan')`` does not
+        raise, and a NaN ``prox_mm`` turns ``nearest_obstacle``'s upper bound
+        into a no-op (nothing compares greater than NaN), so a wall at any
+        distance is reported as the nearest obstacle, the "came within prox_mm"
+        band can never fire again, and the NaN is then emitted through
+        /eyes_status as JSON no strict parser accepts.  A negative distance is
+        the silent kill: every reading is farther than it, so the LIDAR gaze
+        simply stops reacting.
+        """
+        updates = {}
+        for name, value in (("prox_mm", prox_mm), ("close_mm", close_mm)):
+            if value is None:
+                continue
+            v = float(value)
+            if not math.isfinite(v) or v <= 0:
+                raise ValueError(f"{name} must be a positive, finite distance in mm")
+            updates[name] = v
+        if cam_hz is not None:
+            v = float(cam_hz)
+            if not math.isfinite(v):
+                raise ValueError("cam_hz must be a finite number of frames per second")
+            updates["cam_hz"] = max(0.0, v)          # 0 = LIDAR only
+        for name, v in updates.items():
+            setattr(self, name, v)
+        return updates
 
     # ── setup helpers ────────────────────────────────────────────────────────
     @staticmethod

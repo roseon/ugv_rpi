@@ -12,7 +12,8 @@ import math
 import types
 
 from eyes_gaze import (DEFAULT_SCREEN_FOV_DEG, EyeGazer, bearing_to_px,
-                       choose_gaze, gaze_command, nearest_obstacle)
+                       choose_gaze, gaze_command, nearest_obstacle,
+                       parse_enable)
 
 CHECKS = 0
 FAILURES = []
@@ -297,6 +298,78 @@ check("stop() then start() runs again (not silently dead)",
       g._enabled is True and g._thread is not None and g._thread.is_alive())
 g.stop()
 check("a second stop() is harmless", g._thread is None)
+
+# ── the /eyes live-tuning contract ───────────────────────────────────────────
+# float('nan') does not raise, so "it parsed as a float" is not the same as "it
+# is a usable distance": a NaN prox_mm makes the range filter a no-op and then
+# reaches /eyes_status as JSON no strict parser accepts.
+link = FakeLink()
+g = make_gazer(link, scan_for(0.0, 300.0))
+check("a valid retune applies both distances",
+      g.retune(prox_mm="800", close_mm="300") == {"prox_mm": 800.0, "close_mm": 300.0},
+      f"got prox={g.prox_mm} close={g.close_mm}")
+
+before = (g.prox_mm, g.close_mm)
+for bad in ({"prox_mm": "nan"}, {"prox_mm": "inf"}, {"prox_mm": "-5"},
+            {"prox_mm": "0"}, {"close_mm": "nan"}, {"close_mm": "-1"},
+            {"cam_hz": "nan"}, {"cam_hz": "inf"}):
+    try:
+        g.retune(**bad)
+        check(f"retune rejects {bad}", False, "no exception raised")
+    except ValueError:
+        check(f"retune rejects {bad}", True)
+check("a rejected retune changes nothing", (g.prox_mm, g.close_mm) == before,
+      f"got {(g.prox_mm, g.close_mm)} expected {before}")
+
+# The endpoint used to assign as it parsed, so a 400 still applied the first one.
+before = (g.prox_mm, g.close_mm)
+try:
+    g.retune(prox_mm="900", close_mm="oops")
+    check("a partly-invalid retune raises", False, "no exception raised")
+except ValueError:
+    check("a partly-invalid retune raises", True)
+check("a partly-invalid retune applies none of it", (g.prox_mm, g.close_mm) == before,
+      f"got {(g.prox_mm, g.close_mm)} expected {before}")
+check("a negative cam_hz still clamps to LIDAR-only",
+      g.retune(cam_hz="-3")["cam_hz"] == 0.0)
+
+try:
+    make_gazer(FakeLink(), prox_mm=float("nan"))
+    check("the constructor rejects a NaN prox_mm", False, "no exception raised")
+except ValueError:
+    check("the constructor rejects a NaN prox_mm", True)
+
+link = FakeLink()
+g = make_gazer(link, scan_for(0.0, 300.0))
+g.retune(prox_mm="800", close_mm="300")
+check("the gaze still fires after a retune", g.step(now=5.0)["reason"] == "lidar_close",
+      f"got {g.step(now=5.0)['reason']}")
+
+# ── enable parsing ────────────────────────────────────────────────────────────
+check("a missing enable means enable", parse_enable(None) is True)
+for v in ("true", "TRUE", "True", "1", "yes", "on", " true "):
+    check(f"enable={v!r} enables", parse_enable(v) is True)
+for v in ("false", "False", "0", "no", "off"):
+    check(f"enable={v!r} disables", parse_enable(v) is False)
+for v in ("", "maybe", "2"):
+    try:
+        parse_enable(v)
+        check(f"enable={v!r} is rejected rather than inverted", False, "no exception raised")
+    except ValueError:
+        check(f"enable={v!r} is rejected rather than inverted", True)
+
+# ── the status payload must survive a strict JSON parser ──────────────────────
+import json as _json
+
+link = FakeLink()
+g = make_gazer(link, scan_for(0.0, 300.0))
+g.step(now=1.0)
+try:
+    _json.loads(_json.dumps(g.status(1.0)),
+                parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
+    check("status is strict-JSON clean", True)
+except ValueError as e:
+    check("status is strict-JSON clean", False, f"invalid token {e!r}")
 
 # ── summary ───────────────────────────────────────────────────────────────────
 print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} checks passed")

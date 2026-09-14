@@ -960,23 +960,20 @@ def toggle_lidar_avoidance():
 def toggle_eyes():
     """Enable or disable the eyes' gaze, and optionally retune the distances.
     Accepts enable=true/false plus optional prox_mm / close_mm / cam_hz, from
-    either the form body or the query string."""
-    raw = request.form.get('enable') or request.args.get('enable', 'true')
-    try:
-        prox = request.form.get('prox_mm') or request.args.get('prox_mm')
-        close = request.form.get('close_mm') or request.args.get('close_mm')
-        cam_hz = request.form.get('cam_hz') or request.args.get('cam_hz')
-        if prox:
-            eye_gazer.prox_mm = float(prox)
-        if close:
-            eye_gazer.close_mm = float(close)
-        if cam_hz:
-            eye_gazer.cam_hz = max(0.0, float(cam_hz))
-    except ValueError as e:
-        return jsonify({'status': 'error',
-                        'message': f'prox_mm/close_mm/cam_hz must be numbers: {e}'}), 400
+    either the form body or the query string.  An empty value counts as absent,
+    and nothing is applied unless all of it is usable."""
 
-    if raw.lower() == 'true':
+    def param(name):
+        return request.form.get(name) or request.args.get(name) or None
+
+    try:
+        enable = eyes_gaze.parse_enable(param('enable'))
+        eye_gazer.retune(prox_mm=param('prox_mm'), close_mm=param('close_mm'),
+                         cam_hz=param('cam_hz'))
+    except ValueError as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 400
+
+    if enable:
         eye_gazer.start()
         msg = 'eyes gaze enabled'
     else:
