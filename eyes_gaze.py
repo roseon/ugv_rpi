@@ -43,6 +43,12 @@ DEFAULT_CLOSE_MM = 450.0
 # mapping onto the panel, so the two numbers are not the same thing.
 DEFAULT_SCREEN_FOV_DEG = 120.0
 
+# YOLOv8n's class 0 is 'person'.  The eyes look at a person in preference to
+# anything else in the frame: following the person in view is the point of the
+# displays, and the largest box in a room is regularly a chair, a monitor or a
+# door rather than the human being looked at.
+PERSON_LABELS = frozenset({"person", "people", "human"})
+
 # Nearest reading closer than this is treated as noise/self-return, not an object.
 MIN_OBSTACLE_MM = 60.0
 
@@ -163,6 +169,7 @@ class EyeGazer:
         self._cam_hit = None
         self._cam_label = None
         self._cam_raw_hits = 0
+        self._cam_persons = 0
 
         self._hold_px = None
         self._hold_py = None
@@ -265,6 +272,7 @@ class EyeGazer:
             self._cam_hit = None
             self._cam_label = None
             self._cam_raw_hits = 0
+            self._cam_persons = 0
             return None
         if now - self._last_cam_t < 1.0 / self.cam_hz:
             return self._cam_hit
@@ -275,6 +283,7 @@ class EyeGazer:
             self._cam_hit = None
             self._cam_label = None
             self._cam_raw_hits = 0
+            self._cam_persons = 0
             return None
         try:
             hits = self._detect(frame)
@@ -283,17 +292,26 @@ class EyeGazer:
             print(f"[eyes] camera detection failed: {e}")
             self._cam_hit = None
             self._cam_label = None
+            self._cam_persons = 0
             return None
 
         self._cam_raw_hits = len(hits)
+        self._cam_persons = sum(1 for h in hits
+                                if str(h.get("name", "")).lower() in PERSON_LABELS)
         if not hits:
             self._cam_hit = None
             self._cam_label = None
             return None
 
         height, width = frame.shape[:2]
+        # People first.  The largest box in a room is often furniture, and the
+        # eyes pointed at a chair instead of the person standing next to it is
+        # precisely the report this answers.  With no person in frame, the most
+        # prominent thing is still better than staring at nothing.
+        pool = [h for h in hits
+                if str(h.get("name", "")).lower() in PERSON_LABELS] or hits
         best = None
-        for h in hits:
+        for h in pool:
             x1, y1, x2, y2 = h["box"]
             area = max(0, x2 - x1) * max(0, y2 - y1)
             if best is None or area > best[0]:
@@ -301,6 +319,7 @@ class EyeGazer:
         if best is None or width <= 0 or height <= 0:
             self._cam_hit = None
             self._cam_label = None
+            self._cam_persons = 0
             return None
 
         _area, hit, (x1, y1, x2, y2) = best
@@ -464,6 +483,7 @@ class EyeGazer:
             "lidar_bearing_deg": None if lidar is None else round(lidar[1], 1),
             "camera": self._cam_label,
             "camera_hits": self._cam_raw_hits,
+            "camera_persons": self._cam_persons,
             "prox_mm": self.prox_mm,
             "close_mm": self.close_mm,
             "hz": self.hz,

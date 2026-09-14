@@ -189,6 +189,100 @@ check("the largest detection wins", g.status(1.0)["camera"] == "person",
       f"got {g.status(1.0)['camera']}")
 
 
+# The real detector path - no injected detector - had never been run: it parses
+# ultralytics' result objects.  A stand-in with the same shape pins that parsing
+# without needing the weights (yolov8n.pt is not in the repo).
+class _Tensor1D:
+    def __init__(self, values):
+        self.values = values
+
+    def __getitem__(self, i):
+        return self.values[i]
+
+    def tolist(self):
+        return list(self.values)
+
+
+class _Box:
+    def __init__(self, xyxy, cls, conf):
+        self.xyxy = [_Tensor1D(xyxy)]
+        self.cls = _Tensor1D([cls])
+        self.conf = _Tensor1D([conf])
+
+
+class _Result:
+    def __init__(self, boxes):
+        self.boxes = boxes
+
+
+class _FakeYolo:
+    """Stands in for an ultralytics YOLO: model(frame) -> [result]."""
+
+    names = {0: "person", 56: "chair"}
+
+    def __init__(self, boxes):
+        self._boxes = boxes
+
+    def __call__(self, *_a, **_kw):
+        return [_Result(self._boxes)]
+
+
+link = FakeLink()
+g = make_gazer(link, frame=FakeFrame(640, 480), cam_hz=2.0)
+g._model = _FakeYolo([_Box((40, 60, 300, 460), 56, 0.77),      # big chair, left
+                      _Box((400, 90, 560, 470), 0, 0.91)])     # person, right
+st = g.step(now=1.0)
+check("the real detector path parses ultralytics boxes", st["camera"] == "person",
+      f"got {st['camera']}")
+check("the parsed confidence reaches status without error", st["camera_persons"] == 1,
+      f"got {st['camera_persons']}")
+
+# The bug this answers: the largest box in a room is often furniture, so the eyes
+# looked at a chair while the person stood beside it.
+def big_chair_beside_person(_frame):
+    return [{"name": "chair", "conf": 0.9, "box": (0, 0, 300, 470)},        # larger
+            {"name": "person", "conf": 0.9, "box": (400, 100, 560, 460)}]   # to the right
+
+
+link = FakeLink()
+g = make_gazer(link, frame=FakeFrame(640, 480), detector=big_chair_beside_person, cam_hz=2.0)
+st = g.step(now=1.0)
+check("a person is followed even when a bigger object shares the frame",
+      st["camera"] == "person", f"got {st['camera']}")
+check("the gaze follows the person's side of the frame, not the chair's",
+      (st["target"] or {}).get("px", 50) > 55, f"got {st['target']}")
+check("the person count is reported", st["camera_persons"] == 1,
+      f"got {st['camera_persons']}")
+
+
+def two_people(_frame):
+    return [{"name": "person", "conf": 0.9, "box": (400, 100, 560, 460)},
+            {"name": "person", "conf": 0.9, "box": (40, 100, 300, 460)}]
+
+
+link = FakeLink()
+g = make_gazer(link, frame=FakeFrame(640, 480), detector=two_people, cam_hz=2.0)
+st = g.step(now=1.0)
+check("with two people the nearer/larger one is followed",
+      (st["target"] or {}).get("px", 50) < 45, f"got {st['target']}")
+check("both people are counted", st["camera_persons"] == 2,
+      f"got {st['camera_persons']}")
+
+
+def only_objects(_frame):
+    return [{"name": "chair", "conf": 0.9, "box": (400, 100, 560, 460)},
+            {"name": "monitor", "conf": 0.9, "box": (40, 100, 300, 460)}]
+
+
+link = FakeLink()
+g = make_gazer(link, frame=FakeFrame(640, 480), detector=only_objects, cam_hz=2.0)
+st = g.step(now=1.0)
+check("with no person, the largest object still drives the gaze",
+      st["camera"] == "monitor", f"got {st['camera']}")
+check("no people counted when none are seen", st["camera_persons"] == 0,
+      f"got {st['camera_persons']}")
+
+
 def exploding_detector(_frame):
     raise AssertionError("detector must not run when cam_hz=0")
 

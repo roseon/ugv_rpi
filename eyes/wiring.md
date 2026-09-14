@@ -143,7 +143,7 @@ The Uno's outputs are **5 V**; TFT controller chips (ST7735, ILI9341) are rated 
 4. Upload. Each screen shows one big cartoon eye (sclera + colored iris + pupil).
 
 ### Raspberry Pi 5 — the app owns the gaze
-`app.py` drives the eyes through `eyes_gaze.py`. It looks at whatever the LIDAR reports inside `prox_mm` (default **1200 mm**), takes over for anything inside `close_mm` (default **450 mm**) — the "something is getting too close" case — and otherwise follows the most prominent object the camera recognises. It is the **only** writer of `T <px> <py>`; a second writer would interleave pupil positions, so nothing else may open the Uno while it runs.
+`app.py` drives the eyes through `eyes_gaze.py`. It looks at whatever the LIDAR reports inside `prox_mm` (default **1200 mm**), takes over for anything inside `close_mm` (default **450 mm**) — the "something is getting too close" case — and otherwise **follows the people the camera sees**: a `person` detection is preferred over any other object, and only when no person is in frame does the largest object drive the gaze. It is the **only** writer of `T <px> <py>`; a second writer would interleave pupil positions, so nothing else may open the Uno while it runs.
 
 ```bash
 cd ~/ugv_rpi && source ugv-env/bin/activate
@@ -152,6 +152,22 @@ curl -X POST 'localhost:5000/eyes?enable=true'           # on / off
 curl 'localhost:5000/eyes_status'                        # what it is looking at, and why
 curl -X POST 'localhost:5000/eyes?prox_mm=800&close_mm=300'   # retune the distances
 ```
+
+**"Are the eyes following me?"** Stand in front of the robot and read the status. `camera` should become `person`, `camera_persons` should be at least `1`, and `target` should move as you walk across — that is the whole check:
+
+```bash
+curl -s localhost:5000/eyes_status
+# {... "reason": "camera", "target": {"px": 62, "py": 44}, "camera": "person",
+#      "camera_persons": 1, "camera_hits": 2, "sent": 117, "errors": 0, ...}
+```
+
+The three ways to see nothing move, in the order worth checking:
+
+| status says | what it means |
+|---|---|
+| `sent: 0`, no `port` | the gaze never opened the Uno — `serial_ports.uno_port()` did not find it (`ls /dev/serial/by-id/`) |
+| `camera: null`, `camera_persons: 0`, `reason: idle` | the person was not detected: no frame yet, or `[eyes] object model unavailable` in the app log (run the app from `~/ugv_rpi`, where `yolov8n.pt` lives) |
+| `connected: false` | nothing is running the gaze at all — check the app is this version: `grep -c eyes_gaze ~/ugv_rpi/app.py` must not be `0` |
 
 `eyes/pi_eyes.py` is now a **read-only** status tool for that same link — it opens neither the Uno nor the camera, so running it cannot fight the app for either device:
 
