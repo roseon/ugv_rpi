@@ -104,7 +104,11 @@ while stack:
     out.append(os.path.relpath(full, root).replace(os.sep, "/"))
     stack += imported_names(full)
 
-print("\n".join(sorted(out)))
+# Written as bytes, not with print(): on Windows print() emits CRLF, and a
+# trailing \r on each name makes `tar` unable to stat the file and makes the
+# far-side `py_compile` look for a name that does not exist.  The list is
+# consumed by shell word-splitting, which does not strip \r.
+sys.stdout.buffer.write(("\n".join(sorted(out)) + "\n").encode("utf-8"))
 PY
 )"
 
