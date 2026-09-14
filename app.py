@@ -49,6 +49,7 @@ import cv_ctrl
 import audio_ctrl
 import os_info
 import self_drive
+import eyes_gaze
 from perception import sector_min as _sector_min, turn_bias as _turn_bias
 from robot_state import LidarScan
 from spatial_memory import SpatialMemory
@@ -380,6 +381,12 @@ self_driver = self_drive.SelfDriver(
     memory=SpatialMemory(path=thisPath + '/surroundings.json'))
 avoider.planner = self_driver
 cvf.self_driver = self_driver
+
+# Eye displays (two round TFTs on an Arduino Uno): look at whatever is getting
+# too close (LIDAR proximity) or at whatever the camera recognises.  This is the
+# single writer of gaze commands; eyes/pi_eyes.py only reads /eyes_status and
+# opens neither the Uno nor the camera.
+eye_gazer = eyes_gaze.EyeGazer(base, cvf, root=thisPath)
 
 # Self-drive can run as a standalone capable mode: it drives forward and
 # learns the room while avoiding what it has already mapped. 'capable' on
@@ -946,6 +953,42 @@ def toggle_lidar_avoidance():
     return jsonify({'status': 'success', 'message': msg,
                     'avoidance_active': avoider._active,
                     'avoidance_state':  avoider.state})
+
+# ── eye displays (/eyes) ─────────────────────────────────────────────────────
+
+@app.route('/eyes', methods=['POST'])
+def toggle_eyes():
+    """Enable or disable the eyes' gaze, and optionally retune the distances.
+    Accepts enable=true/false plus optional prox_mm / close_mm / cam_hz, from
+    either the form body or the query string."""
+    raw = request.form.get('enable') or request.args.get('enable', 'true')
+    try:
+        prox = request.form.get('prox_mm') or request.args.get('prox_mm')
+        close = request.form.get('close_mm') or request.args.get('close_mm')
+        cam_hz = request.form.get('cam_hz') or request.args.get('cam_hz')
+        if prox:
+            eye_gazer.prox_mm = float(prox)
+        if close:
+            eye_gazer.close_mm = float(close)
+        if cam_hz:
+            eye_gazer.cam_hz = max(0.0, float(cam_hz))
+    except ValueError as e:
+        return jsonify({'status': 'error',
+                        'message': f'prox_mm/close_mm/cam_hz must be numbers: {e}'}), 400
+
+    if raw.lower() == 'true':
+        eye_gazer.start()
+        msg = 'eyes gaze enabled'
+    else:
+        eye_gazer.stop()
+        msg = 'eyes gaze disabled'
+    return jsonify({'status': 'success', 'message': msg,
+                    'eyes': eye_gazer.status()})
+
+@app.route('/eyes_status', methods=['GET'])
+def eyes_status():
+    """What the eyes are looking at right now, and what put them there."""
+    return jsonify(eye_gazer.status())
 
 @app.route('/selfdrive', methods=['POST'])
 def toggle_selfdrive():
@@ -1819,6 +1862,10 @@ if __name__ == "__main__":
     threading.Thread(target=_camera_capture_loop, daemon=True,
                      name="camera-capture").start()
     print("[video] Camera capture thread started – warming up…")
+
+    # Eye displays: react to LIDAR proximity and to what the camera sees.
+    # Started after the camera thread so the first detection has a frame.
+    eye_gazer.start()
 
     # run the main web app
     socketio.run(app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)

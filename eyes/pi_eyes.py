@@ -1,163 +1,163 @@
 #!/usr/bin/env python3
-"""Robot Eyes bridge (Raspberry Pi 5 side).
+"""Eyes link + status tool (Raspberry Pi side) — READ ONLY.
 
-Grabs the USB camera, runs YOLOv8n person detection, and streams the
-person's frame position to the Arduino Uno over serial at ~20 Hz so the
-two TFT eyes look toward them.
+The gaze is owned by the robot app.  ``app.py``'s ``EyeGazer`` (eyes_gaze.py)
+fuses LIDAR proximity with what the camera sees and is the only thing that ever
+writes ``T <px> <py>`` to the Uno.  Two writers on one serial port interleave
+into garbled pupil positions, and a second ``cv2.VideoCapture`` fights the frame
+loop for the camera — so this tool does neither.  It reports what the eyes are
+doing and which node the link is on.
 
-Protocol (115200 baud, ASCII):
-    T <px> <py>   px,py in 0..100, (50,50) = frame center
-    T -1 -1       no person in view
-    PING          Uno replies PONG
+    python pi_eyes.py                  # one-shot status from the running app
+    python pi_eyes.py --watch          # follow it until Ctrl-C
+    python pi_eyes.py --list           # which /dev node is which (no hardware)
+    python pi_eyes.py --url http://192.168.24.25:5000
 
-Usage:
-    python pi_eyes.py                 # auto-detects the Uno by USB identity
-    python pi_eyes.py --list          # show what each USB serial device is
-    python pi_eyes.py --port /dev/ttyUSB0   # override (e.g. a CH340 clone)
+Exit status is 0 when the gaze link is up, 1 otherwise, so it is scriptable.
 """
+
 import argparse
+import json
 import os
 import sys
 import time
+import urllib.error
+import urllib.request
 
-import cv2
-import serial
-from ultralytics import YOLO
+DEFAULT_URL = "http://127.0.0.1:5000"
 
-# serial_ports lives at the repo root; this script is in eyes/.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import serial_ports  # noqa: E402
+# The gaze reasons eyes_gaze.choose_gaze() can report, in plain words.
+REASON_TEXT = {
+    "lidar_close": "something is too close",
+    "camera": "an object the camera recognises",
+    "lidar_near": "something near",
+    "hold": "holding the last gaze",
+    "idle": "nothing worth looking at - centred",
+    "stopped": "gaze switched off",
+}
 
-PERSON_CLASS = 0  # YOLO COCO index for "person"
+
+def fetch_status(base_url, timeout=3.0):
+    """The app's own view of the eyes.  Raises on no app / bad reply."""
+    with urllib.request.urlopen(base_url.rstrip("/") + "/eyes_status",
+                                timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def describe(status):
+    """One short block a human can read at the console."""
+    target = status.get("target")
+    if target:
+        where = f"px={target['px']:>3} py={target['py']:>3}"
+    else:
+        where = "centred (T -1 -1)"
+
+    lidar = ""
+    if status.get("lidar_mm") is not None:
+        lidar = f"  lidar {status['lidar_mm']:.0f} mm at {status['lidar_bearing_deg']:+.1f} deg"
+    cam = status.get("camera")
+    cam_txt = f"  camera={cam}" if cam else ""
+
+    lines = [
+        "eyes:  enabled={}  connected={}  port={}".format(
+            status.get("enabled"), status.get("connected"), status.get("port")),
+        "gaze:  {}  ({})".format(
+            where, REASON_TEXT.get(status.get("reason"), status.get("reason"))),
+        "rules: look at <= {:.0f} mm, take over <= {:.0f} mm, {:.0f} Hz".format(
+            status.get("prox_mm") or 0, status.get("close_mm") or 0,
+            status.get("hz") or 0),
+        "bus:   sent={} errors={} age={}s   hits={}".format(
+            status.get("sent"), status.get("errors"), status.get("age_s"),
+            status.get("camera_hits")),
+    ]
+    if lidar or cam_txt:
+        lines.insert(2, "input: " + (lidar + cam_txt).strip())
+    return "\n".join(lines)
+
+
+def list_devices():
+    """Which /dev node is which.  Reads sysfs only; opens nothing."""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import serial_ports
+    print("USB serial devices:")
+    print(serial_ports.inventory())
+    print()
+    print(f"  eyes' Uno:  {serial_ports.uno_port() or 'not detected'}")
+    print(f"  lidar port: {serial_ports.lidar_port() or 'not detected'}")
+    print(f"  base port:  {serial_ports.base_port()}")
+    print()
+    print("The app opens the Uno; a node listed here being correct does not mean")
+    print("the app has it - check `python pi_eyes.py` for `connected=True`.")
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Stream person position to the eye-display Arduino.")
-    ap.add_argument("--port", default="auto",
-                    help="Uno serial port, or 'auto' (default) to identify the Arduino by USB id")
+    ap = argparse.ArgumentParser(
+        description="Report the robot's eye-gaze state (read-only).")
     ap.add_argument("--list", action="store_true",
-                    help="List the USB serial devices and what each one is, then exit")
-    ap.add_argument("--baud", type=int, default=115200)
-    ap.add_argument("--camera", type=int, default=0, help="OpenCV camera index")
-    ap.add_argument("--conf", type=float, default=0.35, help="YOLO confidence threshold")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="No serial device needed: log the T commands that would be sent")
-    ap.add_argument("--verbose", action="store_true",
-                    help="Print every command even when writing to the serial port")
-    ap.add_argument("--model", default="yolov8n.pt", help="YOLO weights (auto-downloads if missing)")
+                    help="list the USB serial devices and what each one is, then exit")
+    ap.add_argument("--url", default=DEFAULT_URL,
+                    help=f"the robot app's base URL (default {DEFAULT_URL})")
+    ap.add_argument("--watch", action="store_true",
+                    help="poll until Ctrl-C, printing only changes")
+    ap.add_argument("--interval", type=float, default=1.0,
+                    help="seconds between polls in --watch mode (default 1.0)")
+    ap.add_argument("--timeout", type=float, default=3.0,
+                    help="per-request timeout in seconds (default 3.0)")
     args = ap.parse_args()
 
     if args.list:
-        print("USB serial devices:")
-        print(serial_ports.inventory())
-        print(f"\n  eyes' Uno:  {serial_ports.uno_port() or 'not detected'}")
-        print(f"  lidar port: {serial_ports.lidar_port() or 'not detected'}")
-        print(f"  base port:  {serial_ports.base_port()}")
+        list_devices()
         return 0
 
-    port = args.port
-    ser = None
-    if args.dry_run:
-        print("DRY-RUN: no serial device used — logging the gaze stream instead.")
-    else:
-        if port == "auto":
-            port = serial_ports.uno_port()
-            if port is None:
-                print("ERROR: could not identify the eyes' Arduino on USB.")
-                print("USB serial devices found:")
-                print(serial_ports.inventory())
-                print(f"The Uno normally appears as {serial_ports.UNO_NODE}; if it is absent, check")
-                print("`dmesg | tail` — an Uno that fails to configure makes no node.")
-                print("For a CH340-clone Uno, pass its port explicitly, e.g."
-                      f" --port {serial_ports.LIDAR_NODE}")
-                return 1
-            print(f"Auto-detected eyes' Arduino on {port}")
+    def once():
         try:
-            ser = serial.Serial(port, args.baud, timeout=0.2)
-        except serial.SerialException as e:
-            print(f"ERROR: cannot open {port}: {e}")
-            print("Run: python pi_eyes.py --list  (or dmesg | tail) to see the devices,")
-            print("      or use --dry-run to verify detection without the Uno.")
-            return 1
-        ser.reset_input_buffer()
+            status = fetch_status(args.url, args.timeout)
+        except urllib.error.URLError as e:
+            print(f"cannot reach the robot app at {args.url}: {e}")
+            print("The eyes are driven by the app - start it (or pass --url).")
+            return None
+        except (ValueError, json.JSONDecodeError) as e:
+            print(f"the app replied with something that is not JSON: {e}")
+            return None
+        print(describe(status))
+        return status
 
-        # sanity check: the Uno replies PONG to PING
-        ser.write(b"PING\n")
-        deadline = time.time() + 2
-        reply = b""
-        while time.time() < deadline:
-            chunk = ser.read(64)
-            if chunk:
-                reply += chunk
-                if b"PONG" in reply:
-                    break
-        print(f"Uno alive: {'PONG' if b'PONG' in reply else 'NO REPLY — check wiring/USB'}")
-
-    def send(line: bytes):
-        if ser is not None:
-            ser.write(line)
-            if args.verbose:
-                print(f"[sent] {line.decode().rstrip()}")
-        else:
-            print(f"[would send] {line.decode().rstrip()}")
-
-    # bare filename not in cwd? also try the repo root (where the weights live)
-    model_path = args.model
-    if not os.path.exists(model_path) and os.path.sep not in model_path:
-        parent = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, model_path)
-        if os.path.exists(parent):
-            model_path = parent
-    model = YOLO(model_path)
-    cap = cv2.VideoCapture(args.camera)
-    if not cap.isOpened():
-        print(f"ERROR: cannot open camera index {args.camera}")
+    first = once()
+    if first is None:
         return 1
+    if not first.get("connected"):
+        print()
+        print("The gaze link is NOT open. The eyes are probably not enumerating -")
+        print("run `python eyes/pi_eyes.py --list` and `dmesg | tail` on the Pi.")
 
-    dest = port if ser is not None else "LOG (dry-run)"
-    print(f"Tracking people on camera {args.camera} -> {dest}  (Ctrl+C to stop)")
+    if not args.watch:
+        return 0 if first.get("connected") else 1
+
+    last = first
     try:
-        frame_no = 0
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                time.sleep(0.05)
+            time.sleep(max(0.2, args.interval))
+            try:
+                status = fetch_status(args.url, args.timeout)
+            except urllib.error.URLError as e:
+                print(f"lost the app: {e}")
+                return 1
+            except ValueError as e:      # includes json.JSONDecodeError
+                print(f"the app replied with something that is not JSON: {e}")
                 continue
-            h, w = frame.shape[:2]
-
-            # largest person in frame wins
-            best = None  # (area, cx, cy)
-            results = model(frame, verbose=False, conf=args.conf)
-            for r in results:
-                for box in r.boxes:
-                    if int(box.cls[0]) != PERSON_CLASS:
-                        continue
-                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                    area = (x2 - x1) * (y2 - y1)
-                    if best is None or area > best[0]:
-                        best = (area, (x1 + x2) // 2, (y1 + y2) // 2)
-
-            if best:
-                cx, cy = best[1], best[2]
-                px, py = int(cx * 100 / w), int(cy * 100 / h)
-                send(f"T {px} {py}\n".encode())
-            else:
-                send(b"T -1 -1\n")
-
-            frame_no += 1
-            time.sleep(0.05)  # ~20 Hz
+            if (status.get("reason"), status.get("target"),
+                    status.get("connected")) != (last.get("reason"),
+                                                 last.get("target"),
+                                                 last.get("connected")):
+                print("---")
+                print(describe(status))
+                last = status
     except KeyboardInterrupt:
-        print("\nStopped — pupils return to center.")
-        if ser is not None:
-            ser.write(b"T -1 -1\n")
-    finally:
-        cap.release()
-        if ser is not None:
-            ser.close()
-    return 0
+        print("\nstopped")
+    return 0 if last.get("connected") else 1
 
 
 if __name__ == "__main__":
-    import os
     try:
         sys.stdout.reconfigure(line_buffering=True)
         sys.stderr.reconfigure(line_buffering=True)

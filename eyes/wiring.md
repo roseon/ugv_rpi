@@ -12,7 +12,7 @@ This guide wires **two SPI TFT displays** (one per "eye") to an **Arduino Uno**,
 |---|---|
 | 2× SPI TFT display | Most common: **ST7735 1.8″** (128×160) or **ILI9341 2.4″/2.8″** (240×320). Any SPI TFT (ST7789, ILI9488, SSD1331…) works — same wiring, different Arduino library init. |
 | 1× Arduino Uno | The Uno's ATmega16U2/CH340 gives the Pi a serial port over USB. |
-| 1× Raspberry Pi 5 | Runs `pi_eyes.py` (already has `ultralytics` + `pyserial` installed). |
+| 1× Raspberry Pi 5 | Runs the robot app, which owns the eyes' serial link and drives the gaze from LIDAR + camera. |
 | 8× male–female jumper wires | For display → Uno signal wires. |
 | 1× USB A→B cable | Pi 5 USB-A port → Uno USB-B port (power + serial). |
 | (optional) 1× 8-channel level shifter | `TXS0108E` (or 2× `74AHCT125`). Recommended if your display board is strictly 3.3 V logic (see §4). |
@@ -53,9 +53,12 @@ Notes:
 - **Pin budget — and the L298P conflict.** The eyes already use 10 of the Uno's 14 digital pins: `D3 D4 D5 D6 D7 D8 D9 D10 D11 D13`. `D0`/`D1` are the Uno's own USB-serial pair and must stay free, so the only spare digital pins are **`D2`** and **`D12`** (the optional auto-detect MISO). **An L298P motor shield claims `D10`, `D11`, `D12` and `D13`** — `D10`/`D11` are the PWM speed pins for motors A and B, `D12`/`D13` the direction pins (the board inverts one of each direction pair, so it needs only four pins rather than six). That set collides head-on with this build: **`D10` is the LEFT eye's `CS`, and `D11` + `D13` are the RIGHT eye's `MOSI` and `SCK`.** So one Uno cannot carry both:
   - **Stacked as a shield**, those four pins are physically occupied by its headers and no eye wire can reach them — the two cannot be stacked at all.
   - **As a separate module jumpered to the same pins**, the shield's control pins are high-impedance inputs, so panel signals still arrive, but the motors twitch with every display transaction, and any variant that buffers or inverts those lines corrupts the display data outright.
-  If both must live on one Uno, move the **eyes** to the analog header (`A0`–`A5`, usable as digital `14`–`19`, otherwise unused in this build) and leave `D10`–`D13` to the motors.
+  - **If both must live on one Uno — what is actually free.** `D2` and `D12` as digital I/O (*`D12` only if you do not wire the optional auto-detect `MISO`*), and `A0`–`A5` (= digital `14`–`19`) **as digital only: the analog pins cannot `analogWrite`**. `D0`/`D1` stay reserved for the Uno's USB-serial pair.
+  - **There is no free PWM pin, so the analog header cannot give the module speed control.** The Uno's PWM-capable pins are `D3 D5 D6 D9 D10 D11` — six of them — and this build holds **all six**: `D3` is the LEFT eye's `MOSI`, `D5`/`D6` its `RST`/`DC`, `D9`/`D10` its `DC`/`CS`, and `D11` is the RIGHT eye's `MOSI`. An L298P's `EN` (speed) inputs need one of those, so moving the eyes to `A0`–`A5` does not create the speed pin the module wants.
+  - **Which eye signals need no PWM at all:** `CS`, `DC` and `RST`. The sketch drives all three with plain `digitalWrite` and takes them as constants (`L_CS`, `L_DC`, `L_RST`, `R_CS`, `R_DC`, `R_RST`), so moving one to `A0`–`A5` is a one-line change to that constant. **Leave the left eye's `MOSI`/`SCLK` on `D3`/`D4`** — the firmware bit-bangs those two through direct PORTD writes, so moving them costs the fast fill path and needs a firmware change, not just a constant.
+  - **The honest options:** (1) drive the motors from the **ESP32 base controller** — the chassis motors are already that controller's job on this robot, so a second driver on the Uno buys nothing; (2) **accept full-speed-only direction control** — tie the L298P's `EN` pins `HIGH` and put `IN1`/`IN2` on `D2`/`D12` or on `A0`–`A5` (digital only), giving forward/reverse/stop and no speed adjustment; or (3) **free a PWM pin deliberately** by moving one eye's `CS`, `DC` or `RST` to the analog header and redefining it in the sketch, which frees that pin's PWM — e.g. `D10` or `D9` — for the module's `EN`. Prefer `D9`/`D10`: `D5`/`D6` are the only other movable PWM pins here, and they sit on **Timer 0**, which is where `millis()` comes from — the same clock this firmware times its fills and gaze loop with.
 - **A stacked shield can also back-power the Uno.** On the documented L298P shield the motor supply can be jumpered onto the Arduino's `Vin` (its `OPT` jumper), and with that jumper fitted but no motor supply connected it will try to run the motors from USB. If the displays' `VCC`/`LED` are also fed from the Uno's `3.3V` pin, that rail is a shared weak point. Keep the display supply separate.
-- Backlight: tie `LED` to **3.3 V** on both displays. **Do not move the left eye's `LED` to D3** — D3 is that eye's data line (MOSI), and a PWM backlight on it will fight the SPI data and kill the left eye. There is genuinely no spare PWM pin for two backlights on an Uno with this pin map: D2 is the only free pin, and it can only dim *one* eye. If you need to dim, dim on the **supply side** (a series resistor, or a separate adjustable 3.3 V rail), not from the Uno.
+- Backlight: tie `LED` to **3.3 V** on both displays. **Do not move the left eye's `LED` to D3** — D3 is that eye's data line (MOSI), and a PWM backlight on it will fight the SPI data and kill the left eye. There is genuinely no spare PWM pin for the backlights on an Uno with this pin map — the eyes hold all six PWM-capable pins, and `D2` (the one free digital pin) cannot `analogWrite` either, so **no** Uno pin can dim a backlight here. If you need to dim, dim on the **supply side** (a series resistor, or a separate adjustable 3.3 V rail), not from the Uno.
 
 ---
 
@@ -139,14 +142,24 @@ The Uno's outputs are **5 V**; TFT controller chips (ST7735, ILI9341) are rated 
 3. Set `DEFAULT_TYPE` at the top to match your boards (`1`=ST7735, `2`=ILI9341, `3`=GC9A01A round — the default) and confirm the pin constants match §2.
 4. Upload. Each screen shows one big cartoon eye (sclera + colored iris + pupil).
 
-### Raspberry Pi 5 — `pi_eyes.py`
+### Raspberry Pi 5 — the app owns the gaze
+`app.py` drives the eyes through `eyes_gaze.py`. It looks at whatever the LIDAR reports inside `prox_mm` (default **1200 mm**), takes over for anything inside `close_mm` (default **450 mm**) — the "something is getting too close" case — and otherwise follows the most prominent object the camera recognises. It is the **only** writer of `T <px> <py>`; a second writer would interleave pupil positions, so nothing else may open the Uno while it runs.
+
 ```bash
-cd ~/ugv_rpi/eyes
-source ~/ugv_rpi/ugv-env/bin/activate
-python pi_eyes.py            # auto-detects the eyes' Uno by USB identity
-python pi_eyes.py --list     # show each USB serial device and what it is
+cd ~/ugv_rpi && source ugv-env/bin/activate
+python app.py                                            # the gaze owner (on at boot)
+curl -X POST 'localhost:5000/eyes?enable=true'           # on / off
+curl 'localhost:5000/eyes_status'                        # what it is looking at, and why
+curl -X POST 'localhost:5000/eyes?prox_mm=800&close_mm=300'   # retune the distances
 ```
-It grabs the robot's USB camera, runs YOLOv8n (`person` class, conf 0.35), and streams the person's position to the Uno at ~20 Hz.
+
+`eyes/pi_eyes.py` is now a **read-only** status tool for that same link — it opens neither the Uno nor the camera, so running it cannot fight the app for either device:
+
+```bash
+python eyes/pi_eyes.py            # one-shot state of the gaze
+python eyes/pi_eyes.py --watch    # follow it until Ctrl-C
+python eyes/pi_eyes.py --list     # which node is which (touches no hardware)
+```
 
 ### Serial protocol (Pi → Uno, ASCII lines, 115200 baud)
 | Command | Meaning |
@@ -180,8 +193,8 @@ When the Uno powers up (or resets) it prints the pin map and controller IDs over
 4. `PING` should print `PONG` on the Pi. With this firmware the boot fills take milliseconds-to-sub-second (the Uno prints `FILL L: …ms R: …ms`), and during tracking it prints `REPAINT n=25 avg=…ms` every 25 iris moves so you can see the repaint cost on the serial line.
 
 1. **Power only:** plug the Uno into the Pi. Both TFTs should light up (backlight on) and the Arduino sketch draws the two eyes.
-2. **Serial check:** run `python pi_eyes.py` (it auto-detects the Uno) — the script sends `PING` first and prints `Uno alive: PONG`. If it reports that it cannot identify the Arduino, run `python pi_eyes.py --list` and check `dmesg | tail`.
-3. **Manual gaze test:** with the Uno on `/dev/ttyACM0` (see the node table in §3), `echo "T 90 50" > /dev/ttyACM0` → both pupils drift right. `echo "T -1 -1"` → center.
+2. **Serial check:** start the app and run `python eyes/pi_eyes.py` — `connected=True` with `port=/dev/ttyACM0` means the app holds the eyes' Uno (see the node table in §3). If it reports `connected=False`, run `python eyes/pi_eyes.py --list` and check `dmesg | tail`.
+3. **Manual gaze test:** release the port from the app first — `curl -X POST 'localhost:5000/eyes?enable=false'` (the gaze loop would otherwise overwrite you) — then `echo "T 90 50" > /dev/ttyACM0` → both pupils drift right. `echo "T -1 -1"` → center. Re-enable with `?enable=true`.
 4. **Full system:** stand in front of the camera and wave — the eyes should track you left/right/up/down as you move across the frame.
 5. If a display stays blank: swap its `CS`/`DC`/`RST` wires with the other display's to isolate a bad pin vs. a bad display; re-check that `SCK`→`SCK` and `MOSI`→`SDA` (a reversed SDA/SCK is the #1 wiring mistake).
 
@@ -206,7 +219,7 @@ Arduino Uno → parses line → smooths gaze → maps px,py to pupil offset
             → redraws both TFTs (iris+pupil move toward the target)
 ```
 
-The eye firmware is in `eyes_tft/eyes_tft.ino`; the Pi side is `pi_eyes.py`. The current firmware's boot banner is the fastest way to report back: screenshot the serial output (`PING`, probe IDs, per-eye `init:` lines) and tell me which colors each screen showed in the test phase.
+The eye firmware is in `eyes_tft/eyes_tft.ino`; the Pi side is `eyes_gaze.py`, driven by the app's `/eyes` endpoint. The current firmware's boot banner is the fastest way to report back: screenshot the serial output (`PING`, probe IDs, per-eye `init:` lines) and tell me which colors each screen showed in the test phase.
 
 ### Quick fault-finding checklist (run these in order)
 1. **Backlight** — is the white LED behind the screen on? If not, check the `LED` pin is powered (3.3 V) and its wire isn't swapped with another pin. A lit backlight with no image = init/wiring problem; a dark screen = power problem.
