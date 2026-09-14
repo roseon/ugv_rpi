@@ -71,6 +71,11 @@ const uint16_t GREEN = 0x07E0;
 // FastGc9a01 — GC9A01A 240x240 on direct-PORTD bit-bang SPI (left eye).
 // Same init sequence as Adafruit_GC9A01A (copied verbatim), ~20x faster than
 // the Adafruit software-SPI path because per-bit writes hit PORTD directly.
+//
+// CS DISCIPLINE: the panel ignores every byte sent while CS is high, so CS is
+// asserted once per *transaction* (the init sequence, and each fill), never
+// per byte.  Adafruit's driver pulses CS around every byte; holding it low for
+// a whole transaction is equally correct and faster on a bit-banged bus.
 // =============================================================================
 class FastGc9a01 {
 public:
@@ -88,6 +93,12 @@ public:
     delay(20);
     digitalWrite(_rst, HIGH);
     delay(120);
+
+    // Assert CS for the WHOLE init sequence.  Without this the GC9A01A discards
+    // every command below (CS high = interface idle): no SLPOUT, no COLMOD, no
+    // DISPON — the panel stays asleep and the eye shows nothing at all, no
+    // matter how much pixel data is pushed afterwards.
+    digitalWrite(_cs, LOW);
 
     // ---- Adafruit_GC9A01A init sequence (verbatim) ----
     static const uint8_t initcmd[] PROGMEM = {
@@ -151,9 +162,11 @@ public:
       for (uint8_t i = 0; i < n; i++) writeData(pgm_read_byte(a++));
       if (x & 0x80) delay(150);
     }
+    digitalWrite(_cs, HIGH);        // end of init transaction
   }
 
   // ---- one byte, MSB first, SPI mode 0, direct PORTD (MOSI=PD3, SCLK=PD4) ----
+  // Callers must have CS already low (begin(), setAddrWindow()).
   inline void write8(uint8_t b) {
     for (uint8_t m = 0x80; m; m >>= 1) {
       if (b & m) PORTD |= (1 << 3); else PORTD &= ~(1 << 3);
@@ -459,7 +472,7 @@ void eraseIris(int i, float ox, float oy) {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println(F("EYES FW v5 — round GC9A01A geometry + fast left-eye SPI"));
+  Serial.println(F("EYES FW v5.1 — round GC9A01A geometry + fast left-eye SPI (CS-on-init fix)"));
   Serial.println(F("PINS LEFT : CS=10 DC=9 MOSI=3 SCLK=4 RST=8 (fast bit-bang)"));
   Serial.println(F("PINS RIGHT: CS=7  DC=6 MOSI=11 SCK=13 RST=5 (hw SPI)"));
 
