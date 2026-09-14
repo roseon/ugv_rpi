@@ -30,7 +30,8 @@ import perception
 import spatial_memory
 import target_pursuit
 from detection_source import DetectionSource
-from self_drive import SelfDriver
+from self_drive import (HEADING_SMOOTHING, TURN_DEADBAND,  # noqa: F401
+                        TURN_SLEW_PER_TICK, SelfDriver)
 
 FAILS = []
 
@@ -296,7 +297,90 @@ check("clear room, no target -> straight ahead",
 check("scores still published for the UI", len(drv.last_scores) == 13)
 drv.stop()
 
-# ── 6. pursuit: aim, smoothness, arrival, search, veto ──────────────────────
+# ── 5b. steering smoothing: no wobble on noise, no snap on a real turn ─────
+print("--- 5b. steering smoothing ---")
+
+
+def set_scan(drv, pair):
+    """Swap the stub's live scan, exactly as the LIDAR thread does."""
+    angles, dists = pair
+    drv._base.rl.lidar_angles_show = angles
+    drv._base.rl.lidar_distances_show = dists
+
+
+# The candidate arcs overlap (0 deg samples -22..+22, +15 deg samples
+# -8..+38), so a pinch inside -18..-16 deg costs the 0 deg heading samples
+# without touching +15 deg: it makes the +15 heading win on that scan alone.
+# Alternating the pinch side is exactly the scan noise that used to flip the
+# chosen heading, and with it the wheels, every single tick.
+PINCH_LEFT = scan(sectors={d: 900 for d in range(-18, -15)})
+PINCH_RIGHT = scan(sectors={d: 900 for d in range(15, 18)})
+
+drv, _ = planner()
+drv.enable()
+drv._tick()
+turns, chosen = [], []
+for pair in (PINCH_LEFT, PINCH_RIGHT) * 6:
+    set_scan(drv, pair)
+    drv._tick()
+    turns.append(drv.suggested_turn)
+    chosen.append(drv.last_decision.split("\u00b0")[0])
+check("alternating noise -> no wheel differential at all, still aiming straight",
+      turns and set(turns) == {0.0}, "turns=%s" % sorted(set(turns)))
+
+# A wall dead ahead is a real change, so the hold must release at once — but
+# the wheels ramp to the new heading instead of snapping to full lock.
+set_scan(drv, scan(sectors={d: 900 for d in range(-6, 7)}))
+drv._tick()
+one = abs(drv.suggested_turn)
+check("a real obstacle releases the hold and slews (one tick <= slew step)",
+      0.0 < one <= TURN_SLEW_PER_TICK + 1e-9, one)
+for _ in range(12):
+    drv._tick()
+check("...and converges on the new heading",
+      abs(drv.suggested_turn) >= 0.3, drv.suggested_turn)
+
+# Back to a clear room: the residual turn must collapse to EXACTLY zero so the
+# two wheels get identical commands, not a permanent 1% differential.
+set_scan(drv, scan())
+for _ in range(8):
+    drv._tick()
+check("clear room again -> turn decays to exactly 0.0, wheels equal",
+      drv.suggested_turn == 0.0, drv.suggested_turn)
+drv.stop()
+
+# The learned map must be able to forget. It used to count hits to 65535 and
+# decay one per DECAY_SEC, so after a drive every direction read blocked
+# (clearance 0.0 for all 13 headings) and the memory term stopped mattering.
+print("--- 5c. learned map can decay ---")
+mem = spatial_memory.SpatialMemory()
+for _ in range(40):
+    mem.observe_lidar([math.radians(0.0)] * 40, [1000] * 40)
+cxf, cyf = mem._cell(0.0, 1.0)
+check("hit count saturates at HIT_MAX, not 65535",
+      mem._hits[cxf][cyf] == spatial_memory.HIT_MAX,
+      "%d hits at %d,%d" % (mem._hits[cxf][cyf], cxf, cyf))
+check("a saturated cell blocks the heading", mem.blocked(0.0, 1.0) is True)
+for _ in range(spatial_memory.HIT_MAX + 2):
+    mem._decay_locked(time.time() + 3600)
+check("an unobserved cell decays away so clearance recovers",
+      mem.blocked(0.0, 1.0) is False, mem._hits[cxf][cyf])
+
+# Camera-fused object disks share the same ceiling. They used to climb past it
+# (cap 65535) and then decay at 1/s, so a moved-on object stayed blocked.
+ocs = spatial_memory.SpatialMemory()
+for _ in range(30):
+    ocs.observe_object("chair", 0.0, 1.0, 0.9)
+peak_before = max(h for row in ocs._hits for h in row)
+check("an object disk also saturates at HIT_MAX, not 65535",
+      peak_before == spatial_memory.HIT_MAX, "%d hits" % peak_before)
+for _ in range(spatial_memory.HIT_MAX + 2):
+    ocs._decay_locked(time.time() + 3600)
+peak_after = max(h for row in ocs._hits for h in row)
+check("an unobserved object disk also decays away",
+      peak_after == 0, peak_after)
+
+# ── 6. pursuit: aim, smoothness, arrival, search, veto ──────
 print("--- 6. pursuit behaviors ---")
 left_det = [{"name": "chair", "confidence": 0.9, "box": [60, 100, 140, 300]}]
 drv, _ = planner(dets=left_det)

@@ -56,6 +56,30 @@ W_LIDAR = 2.0
 W_MEM   = 1.2
 W_GOAL  = 0.6
 
+# ── steering smoothing (what stops the left/right wobble) ─────────────────────
+# HEADINGS is a discrete set and the score gap between neighbours is routinely
+# smaller than the scan-to-scan noise, so the winner flipped between e.g. +0 and
+# -15 every tick and `best / 90.0` answered each flip with a full differential.
+# The robot wove down a corridor that was straight ahead. Three guards, in
+# order, each covering a failure the one before it cannot:
+#
+#   HEADING_SMOOTHING   an exponential moving average of the chosen heading.
+#                       Symmetric flicker averages out to straight, while a real
+#                       obstacle wins by a large, sustained margin and still
+#                       turns the robot within about a second. (A
+#                       hold-until-beaten-by-margin rule was tried first and
+#                       rejected: in a clear room "straight" only beats a held
+#                       30 deg by 0.10, so the robot kept its old heading and
+#                       never straightened out at all.)
+#   TURN_DEADBAND       snap a residual turn to zero, so coming out of a turn
+#                       ends on exactly-equal wheel commands rather than a
+#                       permanent fraction of a turn.
+#   TURN_SLEW_PER_TICK  hard rate limit on suggested_turn, so no single tick can
+#                       ask the wheels for a full lock.
+HEADING_SMOOTHING  = 0.35
+TURN_DEADBAND      = 0.06
+TURN_SLEW_PER_TICK = 0.08
+
 
 class SelfDriver:
     """Planner thread: learns surroundings, picks a cruise or pursuit heading."""
@@ -78,6 +102,7 @@ class SelfDriver:
         self.halt = False           # executor hint: stop the wheels now
         self.last_scores = []       # [(deg, score)] for the UI
         self.last_decision = "off"
+        self._heading_smooth = 0.0  # EMA of the chosen heading, in degrees
 
     # ── lifecycle (the only way the thread and its flags change) ──────────
     def warm(self):
@@ -99,6 +124,7 @@ class SelfDriver:
         self.suggested_turn = 0.0
         self.halt = False
         self.last_decision = "off"
+        self._heading_smooth = 0.0
         self._stop_evt.set()
         thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
@@ -110,6 +136,7 @@ class SelfDriver:
         self.suggested_turn = 0.0
         self.halt = False
         self.last_decision = "paused"
+        self._heading_smooth = 0.0
         if save:
             self.memory.save()
 
@@ -139,11 +166,13 @@ class SelfDriver:
         """Drive toward one named object; False if the name is blank."""
         if not self.target.set(name, memory=self.memory):
             return False
+        self._heading_smooth = 0.0  # a chase steers by bearing, not by this
         self.enable()
         return True
 
     def clear_target(self):
         self.target.clear()
+        self._heading_smooth = 0.0
 
     # ── memory shortcuts (the map's owner is SpatialMemory) ───────────────
     def save_memory(self):
@@ -219,6 +248,12 @@ class SelfDriver:
 
         self._choose_heading(scan)
 
+    def _slew(self, aim):
+        """Move suggested_turn toward `aim` by at most one slew step."""
+        step = aim - self.suggested_turn
+        step = max(-TURN_SLEW_PER_TICK, min(TURN_SLEW_PER_TICK, step))
+        return round(self.suggested_turn + step, 4)
+
     def _choose_heading(self, scan):
         """Pick the heading to suggest — the one place heading policy lives."""
         target, policy = self.target, self.policy
@@ -249,10 +284,24 @@ class SelfDriver:
         if best_score == float('-inf'):
             # Every heading is blocked right now — hold still and let the
             # avoider's emergency states work it out.
+            self._heading_smooth = 0.0
             self._hold("surrounded — holding position")
             return
 
-        self.suggested_turn = float(max(-1.0, min(1.0, best / 90.0)))
+        # Average the chosen heading over time. Neighbours' scores differ by
+        # less than the scan noise, so the winner flips left/right every tick;
+        # averaging turns that flicker into the straight line it really is,
+        # while a heading that is genuinely better stays chosen and still wins
+        # through within ~1s.
+        self._heading_smooth += HEADING_SMOOTHING * (best - self._heading_smooth)
+        self.suggested_turn = self._slew(
+            float(max(-1.0, min(1.0, self._heading_smooth / 90.0))))
+        # Snap a residual turn away: ramping toward straight approaches 0 without
+        # reaching it (0.167 -> 0.087 -> 0.007 -> ...), which would leave the two
+        # wheels permanently a fraction apart. Below the deadband the wheels get
+        # exactly equal commands, so "straight" really is straight.
+        if abs(self.suggested_turn) < TURN_DEADBAND:
+            self.suggested_turn = 0.0
 
         if pursuing and bearing is None:
             self.suggested_turn = target.next_scan_turn()

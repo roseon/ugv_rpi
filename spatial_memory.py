@@ -32,7 +32,17 @@ MEM_VERSION = 2          # bumped when the lidar frame convention changed
 GRID_SIZE    = 121       # cells per side (±6 m at 10 cm)
 CELL_M       = 0.10      # metres per cell
 MIN_HITS     = 3         # hits before a cell counts as blocked
-DECAY_SEC    = 30.0      # stale cells lose a hit after this long
+HIT_MAX      = 5         # hits saturate here. The count used to be capped at
+                         # 65535, so a cell observed for a minute held ~400 hits
+                         # and the 1-hit-per-DECAY_SEC decay could never clear it:
+                         # after a drive the grid read "blocked" in every
+                         # direction (clearance 0.0 for all 13 headings) and the
+                         # learned map stopped contributing to steering at all.
+DECAY_SEC    = 6.0       # stale cells lose a hit after this long, so with
+                         # HIT_MAX=5 a cell that stops being observed clears in
+                         # ~30s. That makes this a short-horizon obstacle memory
+                         # rather than a room map — which is what a robot-centric
+                         # grid without localisation can honestly be.
 OBJ_RANGE_MAX = 3.0      # metres — objects beyond this are remembered, not avoided
 OBJ_GRID_R   = 0.18      # metres — fused disk radius for an object in the grid
 OBJ_DEDUPE_M = 0.5       # metres — merge a sighting into a known object within this
@@ -109,7 +119,7 @@ class SpatialMemory:
                 mx = (d / 1000.0) * math.sin(a)
                 my = (d / 1000.0) * math.cos(a)
                 cx, cy = self._cell(mx, my)
-                if self._hits[cx][cy] < 65535:
+                if self._hits[cx][cy] < HIT_MAX:
                     self._hits[cx][cy] += 1
                 self._last[cx][cy] = now
             self._decay_locked(now)
@@ -143,8 +153,11 @@ class SpatialMemory:
                     mx = range_m * math.sin(math.radians(bearing_deg)) + r * math.sin(ang)
                     my = range_m * math.cos(math.radians(bearing_deg)) + r * math.cos(ang)
                     cx, cy = self._cell(mx, my)
-                    if self._hits[cx][cy] < 65535:
-                        self._hits[cx][cy] += 2      # objects count double
+                    # Same HIT_MAX ceiling as lidar hits, but objects still count
+                    # double so one sighting stands out. The disk used to climb
+                    # past the cap (65535) and then decay at 1/s, so it stayed
+                    # "blocked" long after the object moved on.
+                    self._hits[cx][cy] = min(HIT_MAX, self._hits[cx][cy] + 2)
                     self._last[cx][cy] = now
         return len(self.objects)
 
@@ -172,7 +185,13 @@ class SpatialMemory:
                       "lidar frame — relearning from scratch")
                 return False
             with self._lock:
-                self._hits = data.get('grid', self._hits)
+                raw = data.get('grid')
+                if raw:
+                    # Clamp on load too: a file written before HIT_MAX existed
+                    # carries counts in the hundreds and would otherwise stay
+                    # saturated for as long as it takes to decay them.
+                    self._hits = [[min(int(v), HIT_MAX) for v in row]
+                                  for row in raw]
                 self.objects = data.get('objects', [])
             print("[memory] loaded surroundings memory: "
                   f"{self.busy_cells} busy cells, {len(self.objects)} objects")

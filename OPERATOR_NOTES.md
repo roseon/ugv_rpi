@@ -164,3 +164,34 @@ to it is silently dropped (`cmdline_ctrl` wants `command=base -c {"T":1,…}` in
 form field), which is how a previous pass concluded the chassis could not move.
 With the correct form the wheels turn: a 4 s forward command moved the front cone
 459 -> 179 mm and advanced the ESP32 odometry in the commanded direction.
+
+## Mapping is short-horizon by design, and steering does not wobble
+
+5. **The learned map must be able to forget.** Hit counts used to be capped at
+65535 and decayed one per `DECAY_SEC`, so a cell observed for a minute held
+hundreds of hits and could never clear. After a drive the grid read blocked in
+every direction — measured `clearance = 0.000` for all 13 headings — so the
+`W_MEM` term was a constant offset and the learned map contributed nothing to
+steering. Now `HIT_MAX = 5`, the same ceiling applies to camera-fused object
+disks (`observe_object` used to climb to 65535 independently), and `load()`
+clamps an old file on read. An unobserved cell clears in ~30 s at
+`DECAY_SEC = 6`. This is a short-horizon obstacle memory, which is the honest
+shape for a robot-centric grid with no localisation. Live after the fix: max
+hits 5, hit histogram spread 1..5, and the 13 heading scores spanning -0.15 to
++3.10 (they used to differ only by the live-LIDAR term).
+
+   Decay only runs inside `observe_lidar`, i.e. while the planner ticks. A
+   paused robot keeps its last map — deliberate — and the first tick after
+   resume clears the stale guard (2768 -> 871 cells within 2 s, observed).
+
+6. **Heading flicker is what "drove left and right" meant.** `HEADINGS` is a
+discrete set and neighbouring scores differ by less than scan noise, so the
+winner flipped (e.g. +0 <-> -15) every tick and `best / 90.0` answered each flip
+with a full wheel differential. Three guards live in `self_drive.py`:
+`HEADING_SMOOTHING` (EMA of the chosen heading), `TURN_DEADBAND` (residual turn
+snaps to exactly 0 so straight really is equal wheel commands) and
+`TURN_SLEW_PER_TICK` (rate limit). A hold-until-beaten-by-margin rule was tried
+first and rejected: in a clear room straight beats a held 30 deg by only 0.10,
+so the robot never straightened out at all. Live turn series over a 15 s drive:
+sign held for long runs (`+0.00` x4, `+0.17` x5, `-0.33` x3, `+0.50` x5) with
+rate-limited ramps, versus tick-by-tick sign flips before.
