@@ -14,6 +14,12 @@ public partial class MainWindow : Window
         ConnText.DataContext = _robot.State;
         ConnText.SetBinding(TextBlock.TextProperty, new System.Windows.Data.Binding("ConnText"));
         ConnText.SetBinding(TextBlock.ForegroundProperty, new System.Windows.Data.Binding("ConnBrush"));
+        ConnDetail.DataContext = _robot.State;
+        ConnDetail.SetBinding(TextBlock.TextProperty, new System.Windows.Data.Binding("ConnDetail"));
+
+        // Pre-fill from the address the robot last answered on, so the app does
+        // not auto-connect to a machine that moved networks months ago.
+        HostBox.Text = AppSettings.LoadHost();
 
         DriveTab.Init(_robot);
         RadarTab.Init(_robot);

@@ -6,14 +6,15 @@ public class RobotState : System.ComponentModel.INotifyPropertyChanged
     public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
     void Raise(string n) => PropertyChanged?.Invoke(this, new(n));
 
-    string _baseUrl = "http://172.30.136.241:5000";
+    // Single owner for the initial address: the one the robot last answered on.
+    string _baseUrl = AppSettings.DefaultHost;
     public string BaseUrl
     {
         get => _baseUrl;
         set { _baseUrl = value.TrimEnd('/'); HostLabel = new Uri(_baseUrl).Host; Raise(nameof(BaseUrl)); }
     }
 
-    string _hostLabel = "172.30.136.241";
+    string _hostLabel = new Uri(AppSettings.DefaultHost).Host;
     public string HostLabel { get => _hostLabel; private set { _hostLabel = value; Raise(nameof(HostLabel)); } }
 
     // ── connection ──
@@ -23,6 +24,12 @@ public class RobotState : System.ComponentModel.INotifyPropertyChanged
     public System.Windows.Media.Brush ConnBrush => Connected
         ? new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0x4F, 0xF5, 0xC0))
         : new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0xFF, 0x93, 0x93));
+
+    // "OFFLINE" alone cannot be acted on: it reads the same for a robot that is
+    // switched off, a Pi whose app is not running, and an address that is simply
+    // stale. This carries the reason, and is empty while the link is healthy.
+    string _connDetail = "";
+    public string ConnDetail { get => _connDetail; set { _connDetail = value; Raise(nameof(ConnDetail)); } }
 
     // ── config (fetched from /config) ──
     public double MaxSpeed = 0.5;

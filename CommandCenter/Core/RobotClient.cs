@@ -19,6 +19,13 @@ public sealed class RobotClient : IAsyncDisposable
     public void Connect(string baseUrl)
     {
         State.BaseUrl = baseUrl;
+        // A reconnect must not leave the previous poll loops alive: they would
+        // keep polling and overwriting the status line beside the new ones, so a
+        // session where the user clicks Connect a few times hammers the robot
+        // with a loop per click.
+        _cts.Cancel();
+        _cts = new CancellationTokenSource();
+        State.ConnDetail = $"connecting to {State.HostLabel} ...";
         Ctrl?.DisposeAsync().AsTask().Wait(200);
         Json?.DisposeAsync().AsTask().Wait(200);
         Video?.DisposeAsync();
@@ -282,8 +289,11 @@ public sealed class RobotClient : IAsyncDisposable
                     State.LidarStreaming = st.GetProperty("streaming").GetBoolean();
                     if (st.TryGetProperty("rx_bps", out var rx)) State.Rx_bps = rx.GetDouble();
                     if (st.TryGetProperty("frames_per_s", out var fps)) State.Frames_per_s = fps.GetDouble();
+                    State.ConnDetail = "";
+                    RememberHost(State.BaseUrl);   // this address answers: start here next time
                 }
-                catch { }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { /* shutting down or reconnecting */ }
+                catch (Exception ex) { State.ConnDetail = DescribeUnreachable(ex); }
             }
         });
 
@@ -313,6 +323,27 @@ public sealed class RobotClient : IAsyncDisposable
             catch { }
         }
     }
+
+    string _savedHost = "";
+
+    /// <summary>Remember an address that answered - once, so a 2 s poll is not a disk write.</summary>
+    void RememberHost(string baseUrl)
+    {
+        if (baseUrl == _savedHost) return;
+        _savedHost = baseUrl;
+        AppSettings.SaveHost(baseUrl);
+    }
+
+    /// <summary>One line the user can act on, in place of a silent OFFLINE light.</summary>
+    string DescribeUnreachable(Exception ex) => ex switch
+    {
+        TaskCanceledException or OperationCanceledException or TimeoutException =>
+            $"no answer from {State.HostLabel} within {_http.Timeout.TotalSeconds:0} s " +
+            "- robot off, app not running, or wrong host",
+        HttpRequestException h =>
+            $"cannot reach {State.HostLabel}: {h.InnerException?.Message ?? h.Message}",
+        _ => $"cannot read {State.HostLabel}: {ex.GetType().Name}: {ex.Message}"
+    };
 
     public async ValueTask DisposeAsync()
     {

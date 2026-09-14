@@ -16,9 +16,11 @@
             <DockPanel>
                 <TextBlock Text="🤖 UGV ROVER" FontSize="16" FontWeight="Bold" Foreground="#FF8AB4F8" VerticalAlignment="Center"/>
                 <TextBlock Text="  host:" Foreground="#FF78909C" VerticalAlignment="Center" Margin="20,0,4,0"/>
-                <TextBox x:Name="HostBox" Width="170" VerticalAlignment="Center" Background="#FF23262B" Foreground="White" BorderBrush="#FF37474F" Text="http://172.30.136.241:5000"/>
+                <TextBox x:Name="HostBox" Width="170" VerticalAlignment="Center" Background="#FF23262B" Foreground="White" BorderBrush="#FF37474F"/>
                 <Button x:Name="ConnectBtn" Content="Connect" Style="{StaticResource OpButton}" Click="OnConnect" Width="90"/>
                 <TextBlock x:Name="ConnText" Text="○ OFFLINE" FontWeight="Bold" VerticalAlignment="Center" Margin="12,0,0,0"/>
+                <TextBlock x:Name="ConnDetail" Text="" Foreground="#FFFFAB91" VerticalAlignment="Center"
+                           Margin="10,0,0,0" MaxWidth="620" TextTrimming="CharacterEllipsis"/>
                 <TextBlock x:Name="LidarWarn" Text="" Foreground="#FFFFB74D" VerticalAlignment="Center" Margin="16,0,0,0"/>
                 <TextBlock Text="Command Center v1.0" Foreground="#FF546E7A" VerticalAlignment="Center" HorizontalAlignment="Right"/>
             </DockPanel>
