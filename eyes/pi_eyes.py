@@ -11,9 +11,12 @@ Protocol (115200 baud, ASCII):
     PING          Uno replies PONG
 
 Usage:
-    python pi_eyes.py --port /dev/ttyACM0
+    python pi_eyes.py                 # auto-detects the Uno by USB identity
+    python pi_eyes.py --list          # show what each USB serial device is
+    python pi_eyes.py --port /dev/ttyUSB0   # override (e.g. a CH340 clone)
 """
 import argparse
+import os
 import sys
 import time
 
@@ -21,12 +24,19 @@ import cv2
 import serial
 from ultralytics import YOLO
 
+# serial_ports lives at the repo root; this script is in eyes/.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import serial_ports  # noqa: E402
+
 PERSON_CLASS = 0  # YOLO COCO index for "person"
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Stream person position to the eye-display Arduino.")
-    ap.add_argument("--port", default="/dev/ttyACM0", help="Uno serial port (also try /dev/ttyUSB0)")
+    ap.add_argument("--port", default="auto",
+                    help="Uno serial port, or 'auto' (default) to identify the Arduino by USB id")
+    ap.add_argument("--list", action="store_true",
+                    help="List the USB serial devices and what each one is, then exit")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--camera", type=int, default=0, help="OpenCV camera index")
     ap.add_argument("--conf", type=float, default=0.35, help="YOLO confidence threshold")
@@ -37,15 +47,36 @@ def main() -> int:
     ap.add_argument("--model", default="yolov8n.pt", help="YOLO weights (auto-downloads if missing)")
     args = ap.parse_args()
 
+    if args.list:
+        print("USB serial devices:")
+        print(serial_ports.inventory())
+        print(f"\n  eyes' Uno:  {serial_ports.uno_port() or 'not detected'}")
+        print(f"  lidar port: {serial_ports.lidar_port() or 'not detected'}")
+        print(f"  base port:  {serial_ports.base_port()}")
+        return 0
+
+    port = args.port
     ser = None
     if args.dry_run:
         print("DRY-RUN: no serial device used — logging the gaze stream instead.")
     else:
+        if port == "auto":
+            port = serial_ports.uno_port()
+            if port is None:
+                print("ERROR: could not identify the eyes' Arduino on USB.")
+                print("USB serial devices found:")
+                print(serial_ports.inventory())
+                print(f"The Uno normally appears as {serial_ports.UNO_NODE}; if it is absent, check")
+                print("`dmesg | tail` — an Uno that fails to configure makes no node.")
+                print("For a CH340-clone Uno, pass its port explicitly, e.g."
+                      f" --port {serial_ports.LIDAR_NODE}")
+                return 1
+            print(f"Auto-detected eyes' Arduino on {port}")
         try:
-            ser = serial.Serial(args.port, args.baud, timeout=0.2)
+            ser = serial.Serial(port, args.baud, timeout=0.2)
         except serial.SerialException as e:
-            print(f"ERROR: cannot open {args.port}: {e}")
-            print("Run: ls /dev/ttyACM* /dev/ttyUSB*  (or dmesg | tail) to find the Uno's port,")
+            print(f"ERROR: cannot open {port}: {e}")
+            print("Run: python pi_eyes.py --list  (or dmesg | tail) to see the devices,")
             print("      or use --dry-run to verify detection without the Uno.")
             return 1
         ser.reset_input_buffer()
@@ -82,7 +113,7 @@ def main() -> int:
         print(f"ERROR: cannot open camera index {args.camera}")
         return 1
 
-    dest = args.port if ser is not None else "LOG (dry-run)"
+    dest = port if ser is not None else "LOG (dry-run)"
     print(f"Tracking people on camera {args.camera} -> {dest}  (Ctrl+C to stop)")
     try:
         frame_no = 0

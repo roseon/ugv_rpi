@@ -195,3 +195,48 @@ first and rejected: in a clear room straight beats a held 30 deg by only 0.10,
 so the robot never straightened out at all. Live turn series over a 15 s drive:
 sign held for long runs (`+0.00` x4, `+0.17` x5, `-0.33` x3, `+0.50` x5) with
 rate-limited ramps, versus tick-by-tick sign flips before.
+
+## Serial device identity has one owner (and the left-eye cause was wrong)
+
+7. **Which USB serial node is which — never guess by glob prefix.** Four links
+exist and only one is the eyes: the eyes' Arduino Uno is `/dev/ttyACM0`
+(`2341:0043`, observed in dmesg as `cdc_acm 1-2:1.0: ttyACM0`), the D500 LIDAR
+adapter is `/dev/ttyUSB0` (`10c4:ea60` CP2102N, confirmed live via
+`/dev/serial/by-id/`), and the base controller is `/dev/ttyAMA0` (the Pi's GPIO
+UART, not USB at all). `base_ctrl._pick_lidar_port()` used to fall back to
+`acm[0]` whenever no ttyUSB bridge existed — that opens the **eyes' Uno** as the
+lidar, holds the port, and `kick_lidar()` DTR-pulses it, which resets an Uno. A
+second rule, `_pick_lidar_baud` choosing 921600 by `port.startswith('/dev/ttyUSB')`,
+would then have driven the Uno at the lidar's rate. Identity now lives in one
+owner, `serial_ports.py` (`uno_port()`, `lidar_port()`, `base_port()`,
+`baud_for()`, `other_ports()`), read from `idVendor`/`idProduct` and
+`/dev/serial/by-id`; both duplicate methods are deleted rather than fenced off,
+and `base_ctrl` no longer globs at all. Regression harness:
+`serial_ports_selftest.py` (35 checks on the Pi).
+
+8. **An Uno that fails to configure makes no node at all — and the measured cause
+is host-side, NOT the display load.** `lsusb` still lists the Uno, which reads as
+"plugged in but broken", but the kernel says `usb 1-2: can't set config #1, error
+-62` (with `xhci-hcd: Timeout while waiting for configure endpoint command`) and
+`/dev/ttyACM0` never appears, so no gaze command reaches the eyes. In the same two
+minutes the Pi's I2C host (`i2c_designware`, hosting the DSI touch panel) and the
+**VideoCore firmware mailbox** clock (`fw-clk-arm`) also timed out, and
+`get_throttled` is `0x0`. Three unrelated hosts on the Pi failing together is a
+**Pi-side host event**: an Arduino 3.3 V rail cannot reach any of them, the burst
+lasted 2 minutes then stopped for 36 (a steady overload is not a 2-minute event),
+and `error -62` is `-ETIME` with the Uno's descriptors having read fine moments
+earlier, so its bridge was alive. The I2C host answers again now (`EREMOTEIO` on
+free addresses = transfer completed, not `ETIMEDOUT`), so the event cleared while
+the Uno stayed stuck with zero interfaces. Recovery is a **port re-enumeration** —
+physical replug, or root-only sysfs (`authorized`/`remove` and
+`/dev/bus/usb/001/00N` are not writable by `ws`). The TFT 3.3 V budget is a real
+precaution against *display* corruption but is NOT the diagnosis here. Cheapest
+check: pull both displays' VCC+LED, replug the Uno, watch for `/dev/ttyACM0`.
+
+9. **`base_ctrl.ReadLine.__init__` opened the lidar before its own state
+existed.** `open_lidar_serial()` ran early in `__init__` and touched `lidar_ser`
+and `_lbuf` before either was assigned, so the first open always raised
+AttributeError, logged `[lidar] open failed ...`, and only recovered via the
+reconnect that app.py's reader loop triggers. The open now happens at the end
+of `__init__`; the log shows `lidar serial connected succeed on /dev/ttyUSB0 @
+921600` on the first attempt with no failure line.

@@ -5,8 +5,8 @@ import threading
 import yaml
 import os
 import time
-import glob
 import numpy as np
+import serial_ports
 
 curpath = os.path.realpath(__file__)
 thisPath = os.path.dirname(curpath)
@@ -24,8 +24,9 @@ class ReadLine:
 			# Ultrasonic sensor (if any) lives on a ttyUSB that is NOT the lidar
 			# adapter.  When the D500 kit's CP2102 is the only ttyUSB, skip this
 			# entirely so we never contend with the lidar reader on the same port.
-			lidar_port = self._pick_lidar_port()
-			others = [p for p in glob.glob('/dev/ttyUSB*') if p != lidar_port]
+			# Which port is the lidar, and which are spare, are serial_ports'
+			# decisions — this file never globs or guesses for itself.
+			others = serial_ports.other_ports(exclude=(serial_ports.lidar_port(),))
 			if others:
 				self.sensor_data_ser = serial.Serial(others[0], 115200)
 				print("/dev/ttyUSB* connected succeed")
@@ -35,7 +36,9 @@ class ReadLine:
 			self.sensor_data_ser = None
 		self.sensor_data_max_len = 51
 
-		self.open_lidar_serial()
+		self.lidar_ser = None
+		# NB: the actual open happens at the END of __init__ — it needs _lbuf
+		# and last_start_angle, which are set below.
 		self.ANGLE_PER_FRAME = 12
 		self.HEADER = 0x54
 		self.lidar_angles = []
@@ -60,25 +63,19 @@ class ReadLine:
 		self.rx_bps = 0.0
 		self.frames_per_s = 0.0
 
-	def _pick_lidar_port(self):
-		"""The D500 kit's adapter is a CP210x bridge on /dev/ttyUSB*; older
-		UART-wired kits stream through the ESP32 base board on /dev/ttyACM*.
-		Prefer the USB bridge, fall back to the base board."""
-		usb = sorted(glob.glob('/dev/ttyUSB*'))
-		acm = sorted(glob.glob('/dev/ttyACM*'))
-		return usb[0] if usb else (acm[0] if acm else None)
-
-	def _pick_lidar_baud(self, port):
-		"""Direct CP2102 adapter (ttyUSB*) carries the D500's native stream at
-		921600 baud; the ESP32 base board (ttyACM*) relays it at 230400."""
-		return 921600 if port.startswith('/dev/ttyUSB') else 230400
+		# Open the lidar only now that every attribute open_lidar_serial()
+		# touches (_lbuf, last_start_angle, lidar_ser) exists.  Opening it
+		# earlier made the first attempt raise AttributeError, log
+		# "[lidar] open failed ...", and recover only via the reconnect that
+		# app.py's reader loop triggers.
+		self.open_lidar_serial()
 
 	def open_lidar_serial(self):
 		"""(Re)open the lidar serial port on the best available device.
 		DTR/RTS are left asserted: on the D500 kit's CP2102 adapter the DTR
 		line drives the sensor's motor PWM, so a de-asserted DTR can stop
 		the motor and starve the stream."""
-		port = self._pick_lidar_port()
+		port = serial_ports.lidar_port()
 		if port is None:
 			print("[lidar] no serial device for lidar")
 			self.lidar_ser = None
@@ -90,7 +87,7 @@ class ReadLine:
 				except Exception:
 					pass
 				self.lidar_ser = None
-			baud = self._pick_lidar_baud(port)
+			baud = serial_ports.baud_for(port)
 			s = serial.Serial(port, baud, timeout=1, dsrdtr=False, rtscts=False)
 			try:
 				s.dtr = True
@@ -111,7 +108,7 @@ class ReadLine:
 		Safe when DTR is not wired: it just idles the line."""
 		print("[lidar] kicking sensor: DTR pulse")
 		try:
-			port = self._pick_lidar_port()
+			port = serial_ports.lidar_port()
 			if self.lidar_ser is not None:
 				try:
 					self.lidar_ser.close()
@@ -119,7 +116,7 @@ class ReadLine:
 					pass
 				self.lidar_ser = None
 			if port:
-				s = serial.Serial(port, self._pick_lidar_baud(port), timeout=0.2, dsrdtr=False, rtscts=False)
+				s = serial.Serial(port, serial_ports.baud_for(port), timeout=0.2, dsrdtr=False, rtscts=False)
 				try:
 					s.dtr = True
 					time.sleep(0.25)

@@ -1,5 +1,6 @@
 # import base_ctrl library
 from base_ctrl import BaseController
+import serial_ports
 import threading
 import yaml, os
 
@@ -14,9 +15,9 @@ def is_raspberry_pi5():
                     return False
 
 if is_raspberry_pi5():
-    base = BaseController('/dev/ttyAMA0', 115200)
+    base = BaseController(serial_ports.base_port(True), 115200)
 else:
-    base = BaseController('/dev/serial0', 115200)
+    base = BaseController(serial_ports.base_port(False), 115200)
 
 threading.Thread(target=lambda: base.breath_light(15), daemon=True).start()
 
