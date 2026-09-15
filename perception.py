@@ -12,8 +12,12 @@ in exactly one place:
     correction is applied once, at the boundary, and every helper below
     expects angles already in the robot frame.
 
-  * Camera boxes map to bearings with box_bearing_deg(). Image x grows to the
-    right, so an object on the LEFT of the frame yields a POSITIVE bearing.
+  * Camera boxes map to bearings with box_bearing_deg(), and to elevations with
+    box_elevation_deg(). Image x grows to the right, so an object on the LEFT of
+    the frame yields a POSITIVE bearing; image y grows downward, so an object
+    BELOW the axis yields a POSITIVE elevation. Both are angles in the robot
+    frame, which is the point: anything that points at a detection (the gaze, the
+    pursuit) can map the two axes with one rule instead of one rule per axis.
 
 Also here: the pure scan helpers built on those angles (sector_min, turn_bias,
 arc_clearance) and object-label identity (norm_name, names_match), because
@@ -26,6 +30,7 @@ import math
 
 LIDAR_ANGLE_OFFSET = math.pi   # +180° baked in by base_ctrl.parse_lidar_frame
 FRAME_WIDTH_PX = 640.0         # detection boxes live in this pixel space
+FRAME_HEIGHT_PX = 480.0        # ...and this aspect is what sets the vertical FOV
 H_FOV_DEG = 60.0               # horizontal FOV assumed when turning x into a bearing
 
 
@@ -45,6 +50,37 @@ def box_bearing_deg(box, frame_width=FRAME_WIDTH_PX, fov_deg=H_FOV_DEG):
     """Camera box -> bearing in the robot frame (+ = left, 0 = straight ahead)."""
     x1, _y1, x2, _y2 = box
     return (0.5 - ((x1 + x2) / 2.0) / frame_width) * fov_deg
+
+
+def v_fov_deg(frame_width=FRAME_WIDTH_PX, frame_height=FRAME_HEIGHT_PX,
+              h_fov_deg=H_FOV_DEG):
+    """The vertical FOV of the same pinhole.
+
+    Square pixels and one focal length: f = (w/2)/tan(h_fov/2), so the vertical
+    half-angle is atan((h/2)/f) and the aspect ratio alone decides it.  For the
+    robot's 640x480 capture at a 60° horizontal FOV that is 46.8°, NOT 60° — a
+    camera that sees 60° across sees less than that down.
+    """
+    return math.degrees(2.0 * math.atan(
+        math.tan(math.radians(h_fov_deg) / 2.0) * (frame_height / frame_width)))
+
+
+def box_elevation_deg(box, frame_height=FRAME_HEIGHT_PX, frame_width=FRAME_WIDTH_PX,
+                      h_fov_deg=H_FOV_DEG):
+    """Camera box -> elevation in the robot frame (+ = below the axis).
+
+    The vertical counterpart of box_bearing_deg, and the same kind of quantity:
+    an angle, so the gaze's two axes can be mapped onto the panels by one rule.
+    They were not, and the mismatch was measured live on the robot: x went
+    through an angle (0.83 aim units per degree, the panel's 120° cone) while y
+    was the raw pixel fraction (2.14 units per degree), which made the vertical
+    2.56x as sensitive as the horizontal - a head a little above the axis swung
+    the pupils far further up the screen than it should, and the two axes
+    disagreed about where the same object was.
+    """
+    _x1, y1, _x2, y2 = box
+    cy = (y1 + y2) / 2.0 / frame_height
+    return (cy - 0.5) * v_fov_deg(frame_width, frame_height, h_fov_deg)
 
 
 # ── scan helpers (angles must already be in the robot frame) ──────────────────

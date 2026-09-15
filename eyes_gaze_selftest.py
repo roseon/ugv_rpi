@@ -12,8 +12,9 @@ import math
 import types
 
 from eyes_gaze import (AIM_EASE_S, DEFAULT_SCREEN_FOV_DEG, EyeGazer, bearing_to_px,
-                       choose_gaze, gaze_command, head_box, nearest_obstacle,
-                       parse_enable)
+                       choose_gaze, elevation_to_py, gaze_command, head_box,
+                       nearest_obstacle, parse_enable)
+from perception import box_elevation_deg, v_fov_deg
 
 CHECKS = 0
 FAILURES = []
@@ -107,6 +108,35 @@ check("bearing +30 (LEFT) -> LEFT of centre", bearing_to_px(30.0) == 25)
 check("bearing -30 (RIGHT) -> RIGHT of centre", bearing_to_px(-30.0) == 75)
 check("bearing +60 -> left edge", bearing_to_px(60.0) == 0)
 check("bearing -60 -> right edge", bearing_to_px(-60.0) == 100)
+# The same rule on the vertical axis.  Both axes are angles in the robot frame
+# and both are mapped with the panel's one cone, so equal angles move the pupils
+# equally far.  The two axes used to disagree: x went through an angle while y
+# used the raw pixel fraction, which came out 2.6x as sensitive per degree and
+# was measured on the robot as |dx| 7.4 units against |dy| 0.2.
+check("elevation 0 deg -> screen centre", elevation_to_py(0.0) == 50)
+check("elevation +30 (BELOW the axis) -> below centre", elevation_to_py(30.0) == 75)
+check("elevation -30 (ABOVE the axis) -> above centre", elevation_to_py(-30.0) == 25)
+check("elevation +60 -> bottom edge", elevation_to_py(60.0) == 100)
+check("elevation -60 -> top edge", elevation_to_py(-60.0) == 0)
+check("elevation beyond the cone clamps",
+      elevation_to_py(200.0) == 100 and elevation_to_py(-200.0) == 0,
+      f"got {elevation_to_py(200.0)}, {elevation_to_py(-200.0)}")
+for _ang in (5.0, 15.0, 30.0, 45.0, 60.0):
+    check(f"one cone: {_ang:.0f} deg moves x and y the same distance from centre",
+          abs(bearing_to_px(_ang) - 50) == abs(elevation_to_py(-_ang) - 50),
+          f"x {abs(bearing_to_px(_ang) - 50)} vs y {abs(elevation_to_py(-_ang) - 50)}")
+
+# The vertical FOV is the pinhole's, not a copy of the horizontal one: a camera
+# that sees 60 deg across a 640x480 frame sees 46.8 deg down it.
+_v = v_fov_deg(640.0, 480.0, 60.0)
+check("the vertical FOV comes from the aspect, not from the horizontal number",
+      abs(_v - 46.826) < 0.01, f"got {_v}")
+check("a box on the axis has no elevation", box_elevation_deg((0.0, 240.0, 64.0, 240.0),
+                                                              480.0, 640.0, 60.0) == 0.0)
+check("a box below the axis has positive elevation",
+      box_elevation_deg((0.0, 400.0, 64.0, 400.0), 480.0, 640.0, 60.0) > 0)
+check("the frame edge is half the vertical FOV, not 30 deg",
+      abs(box_elevation_deg((0.0, 480.0, 64.0, 480.0), 480.0, 640.0, 60.0) - _v / 2.0) < 1e-9)
 check("bearing +180 clamps to the edge", bearing_to_px(180.0) == 0)
 check("bearing -180 clamps to the edge", bearing_to_px(-180.0) == 100)
 check("full screen span is the screen FOV", DEFAULT_SCREEN_FOV_DEG == 120.0)
@@ -125,11 +155,15 @@ check("near-but-not-close obstacle -> lidar_near", (px, py, why) == (50, 50, "li
 px, py, why = choose_gaze((2000.0, 0.0), None, 1200.0, 450.0)
 check("obstacle beyond prox_mm is ignored", (px, py, why) == (None, None, "idle"))
 
-cam = {"bearing_deg": 0.0, "py": 50, "name": "person"}
+cam = {"bearing_deg": 0.0, "name": "person"}          # no elevation field = level
 px, py, why = choose_gaze(None, cam, 1200.0, 450.0)
 check("camera-only -> camera reason", (px, py, why) == (50, 50, "camera"))
+check("a camera hit with no elevation is treated as level, not as missing",
+      choose_gaze(None, cam, 1200.0, 450.0)[1] == 50)
 
-cam_left = {"bearing_deg": 30.0, "py": 30, "name": "person"}
+# 30 deg to the left and 24 deg up: -24 deg is what maps to py 30 under the same
+# cone the bearing uses (50 - 24/120*100).
+cam_left = {"bearing_deg": 30.0, "elevation_deg": -24.0, "name": "person"}
 px, py, why = choose_gaze(None, cam_left, 1200.0, 450.0)
 check("camera box on the LEFT -> left, with its own y",
       px == 25 and py == 30 and why == "camera", f"got px={px} py={py}")
@@ -199,12 +233,14 @@ check("nothing in range -> pupils centre", link.writes[-1] == b"T -1 -1\n")
 def left_box_detector(_frame):
     return [{"name": "chair", "conf": 0.9, "box": (40, 100, 160, 340)}]
 
-# box centre x = 100/640 -> bearing +20.6 deg -> px 33 ; centre y = 220/480 -> py 46
+# box centre x = 100/640 -> bearing +20.6 deg -> px 33
+# box centre y = 220/480 -> elevation -1.95 deg -> py 48  (the pixel fraction
+# would round to 46, which is what this used to assert)
 link = FakeLink()
 g = make_gazer(link, frame=FakeFrame(640, 480), detector=left_box_detector, cam_hz=2.0)
 g.step(now=1.0)
 check("camera box drives the gaze through the real math",
-      link.writes[-1] == b"T 33 46\n", f"got {link.writes}")
+      link.writes[-1] == b"T 33 48\n", f"got {link.writes}")
 
 check("camera hit is reported in status", g.status(1.0)["camera"] == "chair")
 check("camera reason reported", g.status(1.0)["reason"] == "camera")
@@ -419,8 +455,8 @@ allbad = types.SimpleNamespace(angles=[math.radians(0)], distances=[float("nan")
 check("an all-NaN scan yields no obstacle", nearest_obstacle(allbad, 1200.0) is None)
 
 px, py, why = choose_gaze(None, {"bearing_deg": 0.0, "name": "x"}, 1200.0, 450.0)
-check("a camera hit with no py still yields a valid command", (px, py, why) == (50, 50, "camera"),
-      f"got px={px} py={py}")
+check("a camera hit with no elevation still yields a valid command",
+      (px, py, why) == (50, 50, "camera"), f"got px={px} py={py}")
 
 link = FakeLink()
 g = make_gazer(link, scan_for(0.0, 3000.0))
@@ -585,10 +621,12 @@ g = make_gazer(link, frame=FakeFrame(640, 480), detector=person_box_detector(PER
                cam_hz=2.0)
 st = g.step(now=1.0)
 check("a person is aimed at by the head, not by the middle of the body",
-      (st["target"] or {}).get("py") == 27, f"got {st['target']}")
+      (st["target"] or {}).get("py") == 41, f"got {st['target']}")
+check("...and that is the head's angle, not its fraction of the frame",
+      round(128.8 / 480.0 * 100.0) == 27, "the old pixel rule read 27 here")
 check("...while the horizontal aim still follows the person",
       (st["target"] or {}).get("px") == 50, f"got {st['target']}")
-check("the bytes carry the head-level gaze", link.writes[-1] == b"T 50 27\n",
+check("the bytes carry the head-level gaze", link.writes[-1] == b"T 50 41\n",
       f"got {link.writes}")
 check("the published person carries the head the eyes used",
       [round(v, 3) for v in st["detections"][0]["head"]] == [0.436, 0.208, 0.564, 0.328],
@@ -598,7 +636,14 @@ link = FakeLink()
 g = make_gazer(link, frame=FakeFrame(640, 480),
                detector=person_box_detector((200.0, -100.0, 440.0, 300.0)), cam_hz=2.0)
 st = g.step(now=1.0)
-check("a head above the frame clamps to the top of the screen",
+check("a head above the frame is aimed by its angle, not pinned to the top",
+      (st["target"] or {}).get("py") == 25, f"got {st['target']}")
+
+link = FakeLink()
+g = make_gazer(link, frame=FakeFrame(640, 480),
+               detector=person_box_detector((200.0, -2000.0, 440.0, -1600.0)), cam_hz=2.0)
+st = g.step(now=1.0)
+check("a head far past the cone clamps to the top of the screen",
       (st["target"] or {}).get("py") == 0, f"got {st['target']}")
 
 link = FakeLink()
@@ -607,7 +652,7 @@ g = make_gazer(link, frame=FakeFrame(640, 480),
                                      "box": (200.0, 100.0, 440.0, 460.0)}], cam_hz=2.0)
 st = g.step(now=1.0)
 check("a non-person is still aimed at by its whole box",
-      (st["target"] or {}).get("py") == 58, f"got {st['target']}")
+      (st["target"] or {}).get("py") == 53, f"got {st['target']}")
 check("...and publishes no head", "head" not in st["detections"][0],
       f"got {st['detections'][0]}")
 
@@ -830,9 +875,9 @@ check("a step is walked toward, not jumped to", 33 < stepped < 68, f"got {steppe
 # The status names both ends of the gap, so what the eyes were sent can be read
 # off the live robot instead of inferred: the aim trails the head it is chasing.
 check("the head is published where the camera found it",
-      st["target"] == {"px": 68, "py": 27}, f"got {st['target']}")
+      st["target"] == {"px": 68, "py": 41}, f"got {st['target']}")
 check("the aim published is the point the eyes were actually sent",
-      st["aim"] == {"px": stepped, "py": 27}, f"got {st['aim']} vs sent {stepped}")
+      st["aim"] == {"px": stepped, "py": 41}, f"got {st['aim']} vs sent {stepped}")
 check("...which is still behind the head on the step itself",
       st["aim"]["px"] < st["target"]["px"], f"aim {st['aim']} target {st['target']}")
 for i in range(1, 6):

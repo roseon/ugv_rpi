@@ -16,8 +16,10 @@ policy that decides where the pupils point.  Two inputs feed one gaze.
     device.  The eyes follow the most prominent detection (largest box), which
     gives the gaze a name the LIDAR cannot supply.
 
-Both inputs are turned into one bearing and one screen position, so the mapping
-lives in a single place (``bearing_to_px``) rather than once per source.
+Both inputs are turned into angles in the robot frame, and those are mapped onto
+the panel by one rule with one cone (``bearing_to_px`` for x, ``elevation_to_py``
+for y), so the mapping lives in a single place rather than once per source and
+once per axis.
 
 The Uno is opened through ``serial_ports.uno_port()`` — by USB identity, never by
 position — and re-opened when it goes away, because this board has dropped off
@@ -29,7 +31,7 @@ import os
 import threading
 import time
 
-from perception import box_bearing_deg
+from perception import box_bearing_deg, box_elevation_deg
 from robot_state import LidarScan
 
 import serial_ports
@@ -105,6 +107,26 @@ def bearing_to_px(bearing_deg, screen_fov_deg=DEFAULT_SCREEN_FOV_DEG):
     return int(round(min(100.0, max(0.0, px))))
 
 
+def elevation_to_py(elevation_deg, screen_fov_deg=DEFAULT_SCREEN_FOV_DEG):
+    """Robot-frame elevation -> screen y in 0..100 (0 = top edge, 50 = level).
+
+    The same rule as ``bearing_to_px``, on the other axis: both are angles and
+    both are mapped with the panel's one cone, so a target 30 deg up and a target
+    30 deg to the left move the pupils equally far.  Image y grows downward and
+    so does an elevation, hence the plus.
+
+    This axis used to skip the angle entirely and use the raw pixel fraction
+    (``cy * 100 / height``), which is a *different* rule: it worked out at 2.14
+    aim units per degree against the horizontal's 0.83, so the vertical was 2.6x
+    as sensitive, and a head slightly above the axis swung the pupils far higher
+    up the screen than the same offset to the side moved them.  Measured on the
+    robot over 50 samples: the aim matched the angle rule to 0.22 units on x and
+    the pixel rule to 0.28 on y, which is how the mismatch was found.
+    """
+    py = 50.0 + elevation_deg / screen_fov_deg * 100.0
+    return int(round(min(100.0, max(0.0, py))))
+
+
 def gaze_command(px, py):
     """The one place a gaze becomes bytes on the wire."""
     if px is None or py is None:
@@ -160,7 +182,10 @@ def choose_gaze(lidar, camera, prox_mm, close_mm, screen_fov_deg=DEFAULT_SCREEN_
     """One gaze decision from the two inputs.
 
     ``lidar``  : (distance_mm, bearing_deg) | None
-    ``camera`` : {'bearing_deg': float, 'py': int, 'name': str} | None
+    ``camera`` : {'bearing_deg': float, 'elevation_deg': float, 'name': str} | None
+                 Both are angles in the robot frame; turning them into screen
+                 coordinates is this function's job, so there is one rule and
+                 one cone for both axes and no caller can carry a second one.
     Returns    : (px | None, py | None, reason)
 
     Only a return the panels can actually point at takes the gaze.  A bearing
@@ -174,7 +199,8 @@ def choose_gaze(lidar, camera, prox_mm, close_mm, screen_fov_deg=DEFAULT_SCREEN_
         return bearing_to_px(lidar[1], screen_fov_deg), 50, "lidar_close"
     if camera is not None:
         return (bearing_to_px(camera["bearing_deg"], screen_fov_deg),
-                camera.get("py", 50), "camera")
+                elevation_to_py(camera.get("elevation_deg", 0.0), screen_fov_deg),
+                "camera")
     if reachable and lidar[0] <= prox_mm:
         return bearing_to_px(lidar[1], screen_fov_deg), 50, "lidar_near"
     return None, None, "idle"
@@ -482,12 +508,16 @@ class EyeGazer:
         _area, hit, box = best
         # A person is aimed at by the head, anything else by its own box.
         aim = head_box(box) if str(hit.get("name", "")).lower() in PERSON_LABELS else box
-        cy = (aim[1] + aim[3]) / 2.0
         self._cam_hit = {
             "name": hit["name"],
             "conf": hit["conf"],
+            # Both angles in the robot frame.  This dict used to carry a
+            # ready-made `py` taken from the raw pixel fraction, which is where
+            # the second mapping rule lived; the screen position is derived from
+            # these by choose_gaze, with the same cone the bearing uses.
             "bearing_deg": box_bearing_deg(aim, frame_width=float(width)),
-            "py": int(round(min(100.0, max(0.0, cy * 100.0 / height)))),
+            "elevation_deg": box_elevation_deg(aim, frame_height=float(height),
+                                              frame_width=float(width)),
         }
         self._cam_label = hit["name"]
         # The confidence of the box the eyes actually took.  A viewer cannot

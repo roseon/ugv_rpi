@@ -252,12 +252,23 @@ An earlier version of this guide shared one SPI bus (SCK→D13, MOSI→D11 for *
 ## 8. How the eye movement works (data flow)
 
 ```
-Pi 5 camera → YOLOv8n "person" box → center (cx,cy)
-            → px = cx*100/frame_w, py = cy*100/frame_h
+Pi 5 camera → YOLOv8n "person" box → the head box (top 16% x 34%), its centre
+            → bearing   = (0.5 - cx)*60 deg             (perception.box_bearing_deg)
+              elevation = (cy - 0.5)*46.8 deg           (perception.box_elevation_deg;
+                                                         46.8 comes from the aspect:
+                                                         640x480 at 60 deg across)
+            → px = 50 - bearing/120*100,  py = 50 + elevation/120*100   (one cone)
             → serial "T <px> <py>" (or "T -1 -1" when lost)
-Arduino Uno → parses line → smooths gaze → maps px,py to pupil offset
-            → redraws both TFTs (iris+pupil move toward the target)
+Arduino Uno → parses line → maps px,py to pupil offset → redraws both TFTs
 ```
+
+Both axes are angles in the robot frame and both are mapped with the same 120° cone
+(`DEFAULT_SCREEN_FOV_DEG`), so a target 30° up and one 30° to the side move the
+pupils equally far. That was not always true — y used the raw frame fraction
+(`py = cy*100/frame_h`), which is 2.56x as sensitive per degree — and it was
+measurable on the robot: matching the head box against the aim the eyes were sent
+left a residual of **16.9 aim units on y** before the fix and **0.25 after**, with
+x unchanged at 0.2. A head at frame centre aims at (50,50) either way.
 
 The eye firmware is in `eyes_tft/eyes_tft.ino`; the Pi side is `eyes_gaze.py`, driven by the app's `/eyes` endpoint. The current firmware's boot banner is the fastest way to report back: screenshot the serial output (`PING`, probe IDs, per-eye `init:` lines) and tell me which colors each screen showed in the test phase.
 

@@ -348,17 +348,39 @@ the panels have no readback on this wiring (their MISO is unconnected by design)
 so "what the eye looks like" is proved by the firmware's own geometry banner and
 the drawn-offset values, not by pixels.
 
-**One measurement this pass did not change, because it would change behaviour the
-user did not ask about:** the gaze's two axes are mapped by *different rules*.
-`eyes_gaze.py` sends x through `box_bearing_deg()` — a 60° horizontal FOV spread
-over 120° of screen (`DEFAULT_SCREEN_FOV_DEG`), so a head box sweeping 0.14 of the
-frame *width* moves the aim ~7 units — while y is the raw frame fraction
-(`py = cy * 100 / height`), so the same 0.14 of the frame *height* moves the aim
-14 units. Measured on the live robot with a person standing still: |dx| mean 7.5,
-|dy| mean 0.2. The vertical axis therefore travels about **twice** the horizontal
-one for the same camera displacement. Either x or y is wrong: if the eyes' real
-cone is the same in both axes, the vertical mapping needs the camera's vertical
-FOV instead of the raw pixel fraction.
+**Both gaze axes now obey one rule** — the mismatch this file used to record as an
+open gap, closed in the pass that followed. The gaze's x went through an angle
+(`box_bearing_deg()`, a 60° horizontal FOV spread over the panel's 120° cone, i.e.
+0.83 aim units per degree) while y was the raw frame fraction
+(`py = cy * 100 / height`), which works out at 2.14 units per degree — **2.56x as
+sensitive**, so a head slightly above the axis swung the pupils far further up the
+screen than the same offset to the side moved them. Measured on the live robot by
+matching the chosen detection's head box against the aim the eyes were sent:
+
+| over 50 samples | x | y |
+|---|---|---|
+| before, vs the angle rule | **0.22 units** | 16.91 |
+| before, vs the pixel rule | 4.24 | **0.28** |
+| after, vs the angle rule | 0.19 / 0.21 / 0.17 (three runs, 504 samples) | **0.30 / 0.24 / 0.25** |
+| after, vs the pixel rule | 6.5 – 10.1 | 13.1 – 16.8 |
+
+`perception.box_elevation_deg()` is the vertical counterpart of
+`box_bearing_deg()`, taking the vertical FOV from the frame's aspect (640x480 at
+60° across gives **46.8°** down, not 60°), and `eyes_gaze.elevation_to_py()` maps
+it with the same cone `bearing_to_px()` uses. The camera dict handed to
+`choose_gaze()` now carries two angles and no screen coordinate, so there is one
+mapping rule in one place and no caller can smuggle in a second. A head at frame
+centre still aims at (50, 50) — the two rules always agreed there — and the head
+anchor (`head_box`) is untouched.
+
+What the live sweep could not cover: the person in front of the robot never stood
+past ~0.56 of the frame, so the largest right-hand excursion measured is +3.8°
+(aim px 53) against 16° to the left, with y measured 4.3°–19.2° above the axis.
+Both signs and the extremes are pinned in the harness (`elevation_to_py(±30)` ->
+25/75, ±60 -> the edges, beyond the cone -> clamped). A live sample on the robot's
+right needs either a person standing there while `/eyes_status` is sampled, or the
+chassis pivoted ~20°, which this pass did not do: a LIDAR return sits 267 mm
+behind the robot and nobody was watching the floor.
 
 ### The voice has one owner, and the robot's own screen has a face (Sep 15, later)
 
