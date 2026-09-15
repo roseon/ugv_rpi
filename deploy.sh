@@ -17,6 +17,12 @@
 # Not modules, and deliberately not in this set: config.yaml and templates/,
 # which the app reads at runtime and which are already on the robot.
 #
+# These two ARE shipped, though nothing imports them: the face on the robot's
+# own screen is a second process (it owns a display, so it cannot live in the
+# app) and start_face.sh is what launches it at boot.  Kept as an explicit short
+# list rather than a glob, because the manifest's whole point is that the set is
+# knowable - a file with no importer has to be named.
+#
 # The detector's weights ship too when they are here.  They are not importable
 # code, so the manifest cannot find them, and ultralytics would fetch them from
 # GitHub on first use - which a robot with no route there cannot do.
@@ -122,8 +128,18 @@ if [ -z "$FILES" ]; then
   exit 1
 fi
 
+EXTRA=("face_screen.py" "start_face.sh")
+for extra in "${EXTRA[@]}"; do
+  [ -f "$extra" ] && FILES="$FILES
+$extra"
+done
+
 COUNT="$(printf '%s\n' "$FILES" | wc -l | tr -d ' ')"
 LIST="${FILES//$'\n'/ }"          # one line, for the places that need arguments
+# py_compile is for Python.  Feeding it start_face.sh made the far-side check
+# print a SyntaxError and then still exit 0 (the remote shell had no `set -e`),
+# so a failure and a success looked the same from here.  Compile the modules.
+PY_LIST="$(printf '%s\n' "$FILES" | grep -E '\.py$' | tr '\n' ' ')"
 
 if [ "$MODE" = "manifest" ]; then
   echo "# $COUNT local modules app.py reaches (transitively), from $HERE"
@@ -175,10 +191,11 @@ printf '%s\n' "$FILES" | ssh "${SSH_OPTS[@]}" "$ROBOT_HOST" "
   if [ ! -x \"\$P\" ]; then echo '[check] no interpreter at' \"\$P\" '- is the venv there?'; exit 1; fi
   missing=0
   while read -r f; do
-    [ -f \"\$f\" ] || { echo \"[check] MISSING on the robot: \$f\"; missing=1; }
+    [ -f \"\$f\" ] || { echo \"[check] MISSING on the robot: \$f\" >&2; missing=1; }
   done
   [ \$missing -eq 0 ] && echo '[check] every module present'
-  \$P -m py_compile $LIST && echo '[check] all modules compile on the robot'
+  \$P -m py_compile $PY_LIST || { echo '[check] a module does not compile on the robot' >&2; exit 1; }
+  echo '[check] all modules compile on the robot'
   \$P -c 'import eyes_gaze; print(\"[check] gaze module importable:\", eyes_gaze.__file__)'
   if [ -f '$WEIGHTS' ]; then
     echo '[check] gaze weights present: $WEIGHTS'
@@ -218,6 +235,28 @@ if [ "$RESTART" = 1 ]; then
     if [ \"\$n\" != 1 ]; then echo '[deploy] expected exactly one app process' >&2; exit 1; fi
   " || { echo "[deploy] restart did not settle on one process" >&2; exit 1; }
   echo "[deploy] restart done. Gaze check: curl -s localhost:5000/eyes_status"
+
+  # ── the face on the robot's own screen ────────────────────────────────────
+  # The launcher owns the @reboot crontab line, so shipping these two files and
+  # asking it to install is what makes a replaced robot get its face back.  It
+  # is idempotent, and it only reloads a face that is already running, so a
+  # screen someone stopped on purpose stays stopped.
+  # Deliberately names only the launcher.  The launcher stops the face with
+  # `pkill -f` on its module's name, so a shell whose own command line spells
+  # that name kills itself: measured, this block used to test for the module with
+  # `[ -f ... ]`, and the reload then killed the ssh shell mid-block - the deploy
+  # printed both "reloaded" and "could not reach the robot", and its exit status
+  # was 255.  The launcher checks for its own module instead.
+  ssh "${SSH_OPTS[@]}" "$ROBOT_HOST" "
+    cd '$REMOTE_DIR' || exit 1
+    if [ -f start_face.sh ]; then
+      /bin/bash start_face.sh --install-boot || echo '[face] could not install the boot entry' >&2
+      /bin/bash start_face.sh --reload || echo '[face] could not reload the face' >&2
+    else
+      echo '[face] start_face.sh not shipped: the screen face will not start at boot' >&2
+    fi
+  " || echo "[deploy] the face step could not reach the robot - its boot entry is unchanged" >&2
 else
   echo "[deploy] --no-restart: the running app still has the old code"
+  echo "[deploy] --no-restart: the face's boot entry was left alone too (run start_face.sh --install-boot on the robot to repair it)"
 fi
