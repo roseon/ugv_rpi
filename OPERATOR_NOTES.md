@@ -309,7 +309,7 @@ supplied. What that changed, and what it cost:
 |---|---|
 | `eyes_tft.ino` scene | one lens per panel: black strap knuckle at each side, then the goggle ring `r=114` (metal `#B9BEC2`, `#8A9095` outline), the yellow eyelid ring `r=105` (`#F5C842`), the white sclera `r=95`, and the brown iris `r=32` (`#9B4A24`) with a `r=16` pupil and a `r=6` white highlight up-left. RGB565 values were computed, not eyeballed (`0xBDF8`, `0x8C92`, `0xF648`, `0x9A44`). |
 | `eyes_tft.ino` gaze | the iris travel limit is now `sclera - iris - 2 = 61 px` instead of 69, because the goggle's two bands shrank the white the iris is allowed on. A per-axis clamp would push it onto the yellow at diagonal gazes, so it stays the unit-vector rule. |
-| `face_screen.py` + `MouthView.cs` | the mouth: yellow lips (`#F7CE4A` top, `#E3AA2E` lower, `#C98B1E` edge), maroon interior (`#6E1B2A`, `#450E19`), a row of 7 separate white teeth with 1 px gaps hanging from the top edge, a second row of 5 only when the jaw is well open, and a red tongue (`#E06B6B`, `#B84F4E`). Same names, same values, same numbers in both files. |
+| `face_screen.py` + `MouthView.cs` | the mouth, from the reference's own proportions: yellow lips (`#F7CE4A` top, `#E3AA2E` lower, `#C98B1E` edge), maroon interior (`#6E1B2A`, `#450E19`), a lip band `0.14` of the mouth's half-width, a jaw opening to `1.05` of it, 7 white teeth with 1 px gaps hanging from the top of the opening, 5 more rising from the bottom once it is open, and a red tongue (`#E06B6B`, `#B84F4E`) in the throat between them. Both files carry these same factors; the outlines differ on purpose (a bezier with a cupid's bow on the desktop, an ellipse ring on the panel). |
 
 Measured, since an Uno with no panel attached cannot be photographed:
 
@@ -318,13 +318,26 @@ Measured, since an Uno with no panel attached cannot be photographed:
   sclera 25,136 px, iris 2,412 px, pupil 684 px, highlight 113 px, strap 4,154 px —
   and at the travel limit in all eight directions the furthest iris pixel is
   `+0.0 px` beyond the sclera edge, i.e. it never rides onto the yellow.
-- **The panel mouth, live** (grim, centre column classified by colour): idle
-  opening 7 px of maroon inside the yellow lips — the reference's closed smile —
-  and 103 px at a syllable's peak, with the lip band thinning 334 px → 255 px and
-  teeth appearing (5 px → 29 px at the centre column) as it opens.
-- **The desktop mouth, live** (face window captured with its chrome cropped):
-  yellow lip ~71,000 px, teeth grow 7,945 → 12,703 px while speaking, maroon
-  interior 800 → 10,791 px, opening 3..97 px across 13 distinct values.
+- **The panel mouth, live** (grim; note the session is labwc, so the face is an
+  Xwayland client and the X root window scrot sees is black): the mouth is 539 px
+  wide, the lip band is **even** — 33/33 px across and 33/32 px down — and it runs
+  15 px closed → 187 px wide open, with teeth 4,118 → 45,455 px and a tongue
+  0 → 11,804 px. The highlight colour the old drawing painted on the lip
+  (`#FFE9A8`) appears **0 px** anywhere on the panel.
+- **The desktop mouth, live** (face window captured across a sentence): 534–555 px
+  wide and 179 px closed → 257 px open, against the panel's 539/253 for the same
+  jaw; lip ~22,000 px, teeth 25,000 → 40,000 px, maroon 3,500 → 8,800 px, tongue
+  0 → 8,100 px as it opens.
+
+The panel's mouth used to be built from stacked filled ellipses — an outer ring, an
+inner fill and a separate lower lobe — with a fixed highlight ellipse placed on the
+lower lip by a formula that had nothing to do with the band. On the glass that read
+as two yellow lobes with a pale orb floating on them, which is the photograph the
+user sent. It is now one ring plus an opening, the teeth rows follow the opening's
+ellipse (so nothing needs clipping), and `face_screen.py --selftest` measures all of
+it in pixels — band evenness at four radii, the palette inside the mouth, teeth and
+tongue never outside the opening, the mouth's share of the panel, and an ASCII map
+of the shape — because the formulas passed while the panel looked wrong.
 
 **The Uno is now at 87% of flash (28,082 bytes, 1,232 bytes of RAM free)**, down
 from 99% (32,162 bytes, **94 bytes free**). The `ST7735` and `ILI9341` paths that

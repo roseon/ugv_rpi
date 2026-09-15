@@ -17,6 +17,7 @@ Run:  python3 face_screen.py            fullscreen on the panel
 
 import argparse
 import json
+import math
 import os
 import threading
 import time
@@ -36,7 +37,6 @@ MOUTH_DEEP = (0x45, 0x0E, 0x19)
 TOOTH = (0xFF, 0xFA, 0xF2)
 TONGUE = (0xE0, 0x6B, 0x6B)
 TONGUE_DEEP = (0xB8, 0x45, 0x4E)
-GLOSS = (0xFF, 0xE9, 0xA8)
 BACKDROP = (0x12, 0x14, 0x1A)
 CAPTION = (0xED, 0xE7, 0xE3)
 HUD = (0x90, 0xA4, 0xAE)
@@ -50,74 +50,98 @@ POLL_HZ = 5.0
 # ── drawing ──────────────────────────────────────────────────────────────────
 # The motion these are drawn from belongs to speech_face.py, which both faces
 # read: this file only turns (open, wide, smile) into pixels.
+#
+# The numbers are measured off the reference art (a lip band 0.14 of the mouth's
+# half-width, a jaw that opens to 1.05 of it, two tooth rows with the tongue in
+# the throat between them).  CommandCenter/Panels/MouthView.cs draws the same
+# mouth from the same factors, so the two animate identically and differ only in
+# their outline - a bezier with a cupid's bow there, an ellipse ring here.  This
+# comment is the only thing that says so, so change the factors together.
 def mouth_geometry(w, h, open_, wide, smile):
     """Every dimension of the mouth, from its openness and two shape terms."""
-    unit = min(w * 0.34, h * 0.60)
-    cx, cy = w / 2.0, h * 0.54
+    unit = min(w * 0.30, h * 0.55)                   # mouth half-width
+    cx = w / 2.0
+    cy = h * 0.50 - smile * unit * 0.16              # a smile lifts the mouth
     hw = unit * (1 + 0.20 * wide)
-    open_h = (0.06 + 0.94 * open_) * unit * 0.60
-    inner_up, inner_dn = open_h * 0.42, open_h * 0.62
-    lip = unit * 0.20
-    corner_y = cy - smile * unit * 0.16
+    open_h = (0.06 + 0.94 * open_) * unit * 1.05     # never zero: closed is a slit
     return {"cx": cx, "cy": cy, "unit": unit, "hw": hw, "open_h": open_h,
-            "inner_up": inner_up, "inner_dn": inner_dn, "lip": lip, "corner_y": corner_y}
+            "lip": unit * 0.14}
 
 
-def teeth_row(surface, cx, half, y, h, count, colour):
-    """`count` separate teeth with a 1 px gap, centred on cx, spanning 2*half."""
-    y, h = int(y), int(h)
+def teeth_row(surface, cx, cy, hw, half_h, half, h, count, colour, lower=False):
+    """A row of `count` teeth with a 1 px gap, inside the opening's ellipse.
+
+    Every tooth's inner edge follows the ellipse, so a row placed at the curve
+    stays in the mouth without a clip - and following the curve is the shape a
+    Minion's tooth row has.  `lower` rows rise from the bottom edge instead of
+    hanging from the top.  The rounding goes inward, so no pixel lands outside.
+    """
+    def edge(x):
+        """Half-height of the opening at this x."""
+        return half_h * math.sqrt(max(0.0, 1.0 - ((x - cx) / hw) ** 2))
+
     width = max(2, int((half * 2 - (count - 1)) / count))
     x0 = int(cx - half)
     for k in range(count):
-        pygame.draw.rect(surface, colour, pygame.Rect(x0 + k * (width + 1), y, width, h))
+        xl, xr = x0 + k * (width + 1), x0 + k * (width + 1) + width
+        inner = min(edge(xl), edge(xr))
+        if lower:
+            y2, y1 = math.floor(cy + inner - 1), None
+            y1 = math.ceil(max(cy - inner + 1, y2 - h))
+        else:
+            y1, y2 = math.ceil(cy - inner + 1), None
+            y2 = math.floor(min(cy + inner - 1, y1 + h))
+        if y2 - y1 < 2:
+            continue
+        pygame.draw.rect(surface, colour, pygame.Rect(xl, y1, width, y2 - y1))
 
 
 def draw_mouth(surface, geo):
-    """Paint the mouth: lips first, then the opening, then what is inside it."""
-    cx, hw = geo["cx"], geo["hw"]
-    y0 = geo["corner_y"]
-    up, dn, lip = geo["inner_up"], geo["inner_dn"], geo["lip"]
+    """Paint the mouth: one lip ring, then the inside, clipped to the opening."""
+    cx, cy, hw = geo["cx"], geo["cy"], geo["hw"]
+    open_h, lip, unit = geo["open_h"], geo["lip"], geo["unit"]
+    top = cy - open_h / 2
 
     def rect(x, y, w, h):
         return pygame.Rect(int(x), int(y), max(1, int(w)), max(1, int(h)))
 
-    # lips: the whole mouth shape, then the opening on top of it — the band that
-    # stays visible is the lip itself.
-    outer = rect(cx - hw, y0 - up - lip * 2.3, hw * 2, (up + dn) + lip * 4.6)
-    pygame.draw.ellipse(surface, LIP_EDGE, outer)
-    inner = rect(cx - hw * 0.96, y0 - up - lip * 2.0, hw * 1.92, (up + dn) + lip * 4.0)
-    pygame.draw.ellipse(surface, LIP_TOP, inner)
-    lower = rect(cx - hw, y0, hw * 2, dn + lip * 4.2)
-    pygame.draw.ellipse(surface, LIP_BOTTOM, lower)
+    opening = rect(cx - hw, top, hw * 2, open_h)
+    # The lips are one ring, so the band is the same thickness all the way round.
+    # The stacked fills that used to draw this painted two lobes with a seam
+    # between them and a fixed highlight that landed on the lip whatever the jaw
+    # was doing; both were visible in a photograph of the panel.
+    pygame.draw.ellipse(surface, LIP_EDGE,
+                        rect(cx - hw - lip, top - lip, (hw + lip) * 2, open_h + lip * 2))
+    body = rect(cx - hw - lip * 0.84, top - lip * 0.84, (hw + lip * 0.84) * 2,
+                open_h + lip * 1.68)
+    pygame.draw.ellipse(surface, LIP_TOP, body)
+    # The lower lip is shaded, and the shading stays inside the band: a fill that
+    # overshot it made the bottom lip 4 px thicker than the sides, which is the
+    # kind of thing that reads as a separate lobe on a panel.
+    pygame.draw.ellipse(surface, LIP_BOTTOM,
+                        rect(body.x + body.w * 0.02, body.y + body.h * 0.40,
+                             body.w * 0.96, body.h * 0.58))
 
-    open_h = up + dn
-    opening = rect(cx - hw, y0 - up, hw * 2, open_h)
     pygame.draw.ellipse(surface, MOUTH_BACK, opening)
-    # The shading inside the opening must stay inside it.  An ellipse scaled and
-    # nudged down within these factors is provably contained (0.72² + 0.032² < 1);
-    # measured before, a taller one painted deep red over the lower lip.
-    deep_w, deep_h = hw * 1.44, open_h * 0.68
     pygame.draw.ellipse(surface, MOUTH_DEEP,
-                        rect(cx - deep_w / 2, y0 - up + (open_h - deep_h) * 0.55, deep_w, deep_h))
+                        rect(cx - hw * 0.90, top + open_h * 0.05, hw * 1.80, open_h * 0.90))
 
-    # What is visible inside: the upper row of teeth hanging from the top edge,
-    # the tongue below it, and a lower row once the jaw is open past a sliver.
-    teeth_h = min(geo["open_h"] * 0.45, geo["unit"] * 0.11)
+    # What is visible inside: the upper row hanging from the top of the opening,
+    # the tongue in the throat below it, and the lower row in front of the tongue
+    # once the jaw is open past a sliver.
+    teeth_h = min(open_h * 0.45, unit * 0.30)
     if teeth_h > 1:
-        teeth_row(surface, cx, hw * 0.86, y0 - up * 0.85, teeth_h, TEETH_TOP, TOOTH)
-    lower_h = min(geo["open_h"] * 0.26, geo["unit"] * 0.06)
-    if lower_h > 1 and geo["open_h"] > geo["unit"] * 0.16:
-        teeth_row(surface, cx, hw * 0.80, y0 + dn * 0.80 - lower_h, lower_h, TEETH_BOTTOM, TOOTH)
-    if geo["open_h"] > geo["unit"] * 0.14:
-        tongue = rect(cx - hw * 0.58, y0 + dn * 0.55 - geo["open_h"] * 0.34,
-                      hw * 1.16, geo["open_h"] * 0.68)
+        teeth_row(surface, cx, cy, hw, open_h / 2, hw * 0.88, teeth_h, TEETH_TOP, TOOTH)
+    if open_h > unit * 0.14:
+        tongue = rect(cx - hw * 0.55, cy - open_h * 0.10, hw * 1.10, open_h * 0.34)
         pygame.draw.ellipse(surface, TONGUE, tongue)
-        if tongue.h > 6:
-            pygame.draw.ellipse(surface, TONGUE_DEEP, rect(tongue.x + tongue.w * 0.18,
-                                                           tongue.y + tongue.h * 0.55,
-                                                           tongue.w * 0.64, tongue.h * 0.42))
-    pygame.draw.ellipse(surface, GLOSS, rect(cx - hw * 0.42, y0 + dn * 1.05 + lip * 2.2,
-                                            hw * 0.44, lip * 0.6))
+        pygame.draw.ellipse(surface, TONGUE_DEEP,
+                            rect(tongue.x + tongue.w * 0.20, tongue.y + tongue.h * 0.52,
+                                 tongue.w * 0.60, tongue.h * 0.46))
+    lower_h = min(open_h * 0.30, unit * 0.20)
+    if lower_h > 1 and open_h > unit * 0.16:
+        teeth_row(surface, cx, cy, hw, open_h / 2, hw * 0.80, lower_h, TEETH_BOTTOM,
+                  TOOTH, lower=True)
 
 
 class SpeechFeed:
@@ -316,6 +340,90 @@ def selftest():
     feed._state = dict(feed._state, available=False, curve=[], error="no app")
     print("   with no robot: opening %.1f px" % face.step(0.0)["open_h"])
     assert face.step(0.0)["open_h"] < 20, "the mouth should rest closed"
+
+    # The shape itself, against the art it is drawn from.  A mouth built from
+    # stacked filled ellipses passed every check above and still looked like two
+    # lobes with a highlight floating on the lip in a photograph of the panel, so
+    # the shape is checked in pixels, not just in formulas.
+    print("== the mouth matches the reference art ==")
+    os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+    if not pygame.get_init():
+        pygame.init()
+    w, h = face.size
+    shut = mouth_geometry(w, h, 0.0, 0.0, 0.0)
+    open_geo = mouth_geometry(w, h, 1.0, 0.0, 0.0)
+    mouth_w = shut["hw"] * 2 + shut["lip"] * 2
+    print("   lip band is %.3f of the mouth's width (reference 0.04-0.08)"
+          % (shut["lip"] / mouth_w))
+    assert 0.04 < shut["lip"] / mouth_w < 0.09, "the lip band is not the reference's"
+    print("   the mouth is %.3f of the panel wide (reference 0.65)" % (mouth_w / w))
+    assert 0.55 < mouth_w / w < 0.75, "the mouth is the wrong size for the panel"
+    # The reference's own mouth is nearly round, which a 16:9 panel cannot spend
+    # the height on; what matters is that the jaw really drops instead of the
+    # mouth staying a slit.
+    tall = (open_geo["open_h"] + open_geo["lip"] * 2) / mouth_w
+    print("   wide open it is %.2f as tall as it is wide (the reference's cell is ~1)" % tall)
+    assert 0.5 < tall < 1.2, "a wide-open Minion mouth is not a slit"
+
+    surf = pygame.Surface((w, h))
+    surf.fill(BACKDROP)
+    geo = mouth_geometry(w, h, 1.0, 0.25, 0.2)
+    draw_mouth(surf, geo)
+    cx, cy, hw, half_h = geo["cx"], geo["cy"], geo["hw"], geo["open_h"] / 2
+
+    def band(axis, sign):
+        """Lip pixels crossed walking out from the opening's edge, one radius."""
+        if axis == "x":
+            at = lambda k: (int(cx + sign * (hw + k)), int(cy))
+        else:
+            at = lambda k: (int(cx), int(cy + sign * (half_h + k)))
+        n = 0
+        for k in range(int(geo["lip"] * 2) + 4):
+            x, y = at(k)
+            if not (0 <= x < w and 0 <= y < h):
+                break
+            if surf.get_at((x, y))[:3] in (LIP_EDGE, LIP_TOP, LIP_BOTTOM):
+                n += 1
+            elif n:
+                break
+        return n
+
+    bands = {"left": band("x", -1), "right": band("x", 1),
+             "up": band("y", -1), "down": band("y", 1)}
+    print("   lip band px at left/right/up/down: %s" % bands)
+    assert min(bands.values()) >= int(geo["lip"] * 0.5), "there is no lip band somewhere"
+    assert max(bands.values()) - min(bands.values()) <= 3, "the lip band is uneven (lobes)"
+
+    palette = {BACKDROP, LIP_EDGE, LIP_TOP, LIP_BOTTOM, MOUTH_BACK, MOUTH_DEEP,
+               TOOTH, TONGUE, TONGUE_DEEP}
+    seen, strays, escapes = {}, {}, 0
+    for y in range(h):
+        for x in range(w):
+            colour = surf.get_at((x, y))[:3]
+            seen[colour] = seen.get(colour, 0) + 1
+            if colour not in palette:
+                strays[colour] = strays.get(colour, 0) + 1
+            elif colour in (TOOTH, TONGUE, TONGUE_DEEP):
+                if ((x - cx) / hw) ** 2 + ((y - cy) / half_h) ** 2 > 1.0:
+                    escapes += 1
+    print("   pixels: teeth %d, interior %d, tongue %d"
+          % (seen.get(TOOTH, 0), seen.get(MOUTH_BACK, 0) + seen.get(MOUTH_DEEP, 0),
+             seen.get(TONGUE, 0) + seen.get(TONGUE_DEEP, 0)))
+    assert seen.get(TOOTH, 0) > 2000 and seen.get(MOUTH_BACK, 0) > 1000
+    assert seen.get(TONGUE, 0) + seen.get(TONGUE_DEEP, 0) > 200, "no tongue when wide open"
+    print("   colours outside the mouth's palette: %s" % (strays or "none"))
+    assert not strays, "something that is not the mouth is being drawn"
+    print("   teeth/tongue pixels outside the opening: %d" % escapes)
+    assert escapes == 0, "the inside of the mouth is not clipped to the opening"
+    print("   the shape, in pixels (Y lip, . throat, # tooth, t tongue):")
+    for j in range(14):
+        row = ""
+        for i in range(52):
+            colour = surf.get_at((int(w * (i + 0.5) / 52), int(h * (0.30 + 0.62 * (j + 0.5) / 14))))[:3]
+            row += {LIP_TOP: "Y", LIP_BOTTOM: "Y", LIP_EDGE: "y"}.get(colour, "")\
+                or {MOUTH_BACK: "m", MOUTH_DEEP: "."}.get(colour, "")\
+                or ("#" if colour == TOOTH else "t" if colour in (TONGUE, TONGUE_DEEP) else " ")
+        print("    " + row)
     print("FACE-SCREEN SELFTEST PASSED")
 
 

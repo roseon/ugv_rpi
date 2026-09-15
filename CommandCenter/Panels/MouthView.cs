@@ -42,7 +42,6 @@ public sealed class MouthView : FrameworkElement
     static readonly Color Tooth = Color.FromRgb(0xFF, 0xFA, 0xF2);
     static readonly Color Tongue = Color.FromRgb(0xE0, 0x6B, 0x6B);
     static readonly Color TongueDeep = Color.FromRgb(0xB8, 0x45, 0x4E);
-    static readonly Color Gloss = Color.FromArgb(0x66, 0xFF, 0xE9, 0xA8);
     const int TeethTop = 7;                       // the reference shows a full row
     const int TeethBottom = 5;
 
@@ -124,11 +123,16 @@ public sealed class MouthView : FrameworkElement
     }
 
     // ── drawing ───────────────────────────────────────────────────────────────
+    // The factors below are the reference art's, and they are the same ones
+    // face_screen.py draws the robot's own panel from: same half-width, jaw, lip
+    // thickness and tooth rows, so the two animate identically and differ only in
+    // their outline (this one is a bezier with a cupid's bow, the panel's is an
+    // ellipse ring).  Change the factors together.
     double Measure(double w, double h, out double cx, out double cy, out double unit)
     {
         cx = w / 2;
-        cy = h * 0.54;
-        unit = Math.Min(w * 0.34, h * 0.60);            // mouth half-width
+        cy = h * 0.50;
+        unit = Math.Min(w * 0.30, h * 0.55);            // mouth half-width
         return unit;
     }
 
@@ -139,10 +143,10 @@ public sealed class MouthView : FrameworkElement
 
         double W = Measure(w, h, out double cx, out double cy, out _);
         double hw = W * (1 + 0.20 * _wide);              // half-width
-        double openH = (0.06 + 0.94 * _open) * W * 0.60; // gap between the inner edges
-        double innerUp = openH * 0.42;
-        double innerDn = openH * 0.62;
-        double lip = W * 0.20;                           // lip thickness
+        double openH = (0.06 + 0.94 * _open) * W * 1.05; // gap between the inner edges
+        double innerUp = openH * 0.50;
+        double innerDn = openH * 0.50;
+        double lip = W * 0.14;                           // lip thickness
         double cornerY = cy - _smile * W * 0.16;         // a smile lifts the corners
         var left = new Point(cx - hw, cornerY);
         var right = new Point(cx + hw, cornerY);
@@ -213,20 +217,23 @@ public sealed class MouthView : FrameworkElement
         double hw = (right.X - left.X) / 2;
         var toothBrush = new LinearGradientBrush(Tooth, Color.FromRgb(0xD6, 0xCE, 0xC2),
                                                 new Point(0.5, 0), new Point(0.5, 1));
-        double upperH = Math.Min(openH * 0.45, W * 0.11);
+        // Upper teeth hang from the opening's top edge, the tongue sits in the
+        // throat below them, and the lower row is drawn last so it is in front of
+        // the tongue - the order face_screen.py paints them in.
+        double upperH = Math.Min(openH * 0.45, W * 0.30);
         if (upperH > 1.0)
-            TeethRow(dc, toothBrush, cx, hw * 0.86, cornerY - innerUp * 0.85, upperH, TeethTop);
-
-        double lowerH = Math.Min(openH * 0.26, W * 0.06);
-        if (lowerH > 1.0 && openH > W * 0.16)
-            TeethRow(dc, toothBrush, cx, hw * 0.80, cornerY + innerDn * 0.80 - lowerH, lowerH, TeethBottom);
+            TeethRow(dc, toothBrush, cx, hw * 0.88, cornerY - innerUp, upperH, TeethTop);
 
         // The tongue only shows once the jaw is properly open.
         if (openH > W * 0.14)
         {
             var tongue = new LinearGradientBrush(Tongue, TongueDeep, new Point(0.5, 0), new Point(0.5, 1));
-            dc.DrawEllipse(tongue, null, new Point(cx, cornerY + innerDn * 0.55), hw * 0.58, openH * 0.34);
+            dc.DrawEllipse(tongue, null, new Point(cx, cornerY + openH * 0.07), hw * 0.55, openH * 0.17);
         }
+
+        double lowerH = Math.Min(openH * 0.30, W * 0.20);
+        if (lowerH > 1.0 && openH > W * 0.16)
+            TeethRow(dc, toothBrush, cx, hw * 0.80, cornerY + innerDn - lowerH, lowerH, TeethBottom);
     }
 
     void DrawLips(DrawingContext dc, Point left, Point right, double cx, double hw,
@@ -238,15 +245,17 @@ public sealed class MouthView : FrameworkElement
 
         // Upper lip: out from the left corner, over a cupid's bow, to the right,
         // then back along the inner edge - so the lip is exactly the band between
-        // the outer shape and the opening.
+        // the outer shape and the opening.  The multipliers are the reference's
+        // thin band: at 2.8/2.1/1.5 the lip was 377 px tall around a 207 px jaw,
+        // nearly twice the band the panel draws for the same mouth.
         var upper = new PathFigure { StartPoint = left, IsClosed = true, IsFilled = true };
         upper.Segments.Add(new BezierSegment(
-            new Point(left.X + hw * 0.45, cornerY - innerUp * 0.9 - lip * 2.8),
-            new Point(cx - hw * 0.52, cornerY - innerUp * 1.05 - lip * 2.1),
-            new Point(cx - hw * 0.12, cornerY - innerUp * 1.10 - lip * 1.5), true));
+            new Point(left.X + hw * 0.45, cornerY - innerUp * 0.9 - lip * 1.5),
+            new Point(cx - hw * 0.52, cornerY - innerUp * 1.05 - lip * 1.2),
+            new Point(cx - hw * 0.12, cornerY - innerUp * 1.10 - lip * 0.9), true));
         upper.Segments.Add(new BezierSegment(
-            new Point(cx + hw * 0.12, cornerY - innerUp * 1.10 - lip * 1.5),
-            new Point(cx + hw * 0.52, cornerY - innerUp * 1.05 - lip * 2.1),
+            new Point(cx + hw * 0.12, cornerY - innerUp * 1.10 - lip * 0.9),
+            new Point(cx + hw * 0.52, cornerY - innerUp * 1.05 - lip * 1.2),
             right, true));
         upper.Segments.Add(new BezierSegment(
             new Point(right.X - dx, cornerY - innerUp),
@@ -261,23 +270,21 @@ public sealed class MouthView : FrameworkElement
             new Point(left.X + dx, cornerY + innerDn),
             new Point(right.X - dx, cornerY + innerDn), right, true));
         lower.Segments.Add(new BezierSegment(
-            new Point(right.X - hw * 0.45, cornerY + innerDn * 1.0 + lip * 3.0),
-            new Point(cx + hw * 0.55, cornerY + innerDn * 1.05 + lip * 3.3),
-            new Point(cx, cornerY + innerDn * 1.05 + lip * 2.4), true));
+            new Point(right.X - hw * 0.45, cornerY + innerDn * 1.0 + lip * 1.6),
+            new Point(cx + hw * 0.55, cornerY + innerDn * 1.05 + lip * 1.8),
+            new Point(cx, cornerY + innerDn * 1.05 + lip * 1.4), true));
         lower.Segments.Add(new BezierSegment(
-            new Point(cx - hw * 0.55, cornerY + innerDn * 1.05 + lip * 3.3),
-            new Point(left.X + hw * 0.45, cornerY + innerDn * 1.0 + lip * 3.0),
+            new Point(cx - hw * 0.55, cornerY + innerDn * 1.05 + lip * 1.8),
+            new Point(left.X + hw * 0.45, cornerY + innerDn * 1.0 + lip * 1.6),
             left, true));
         var lg = new PathGeometry();
         lg.Figures.Add(lower);
         dc.DrawGeometry(lips, lipPen, lg);
 
-        // A wet highlight across the lower lip, and the dark mouth line at the
-        // corners: two touches that make a flat shape read as a mouth.
-        var gloss = new SolidColorBrush(Gloss);
-        dc.DrawEllipse(gloss, null,
-            new Point(cx - hw * 0.20, cornerY + innerDn * 1.05 + lip * 2.4),
-            hw * 0.22, lip * 0.30);
+        // The dark mouth line at the corners: one touch that makes a flat shape
+        // read as a mouth.  There used to be a highlight ellipse on the lower lip
+        // beside it, placed by a formula that had nothing to do with the lip band
+        // - on the panel it read as a pale orb floating on the mouth.
         var corner = new SolidColorBrush(Color.FromArgb(0x99, 0x3A, 0x0B, 0x14));
         dc.DrawEllipse(corner, null, left, 2.2, 2.2);
         dc.DrawEllipse(corner, null, right, 2.2, 2.2);
