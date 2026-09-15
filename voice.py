@@ -10,10 +10,12 @@ which caller happened to be written first.
 **Why the parameters look like this.** No commercial TTS ships the licensed
 Minion voice — it is performed, in an invented language, and it is not a voice
 token any service sells.  What makes speech read as a Minion is a small register
-pushed far up in pitch, spoken quickly, with the odd Minion word dropped in.
-That is the voice below.  It used to be four presets with a ``POST /voice``
-picker; nobody asked for a picker and nothing in the UI could reach it, so the
-voice is a definition now rather than a choice.
+pushed far up in pitch and spoken quickly; the *language* is ``minionese.py``,
+trained from the corpus the user supplied, and it is what turns a sentence into
+the words below.  It used to be six hardcoded interjections glued in front of the
+caller's English, which is English with a costume on, not Minionese.  A ``POST
+/voice`` picker with four presets came and went too: nobody asked for a picker
+to choose the voice, so the voice is a definition now rather than a choice.
 
 **One voice at a time.** A module-level lock owns that: two callers that used to
 talk over each other (a UI toggle through audio_ctrl and Lance's reply through
@@ -25,12 +27,12 @@ Pi 5 screen and the desktop both animate the syllables actually coming out.
 
 import logging
 import os
-import random
 import subprocess
 import tempfile
 import threading
 import urllib.request
 
+import minionese
 import speech_face
 
 # ── the service ───────────────────────────────────────────────────────────────
@@ -45,8 +47,6 @@ AZURE_REGION = os.environ.get("AZURE_SPEECH_REGION", "eastus2")
 VOICE = "en-US-JennyNeural"
 PITCH = "+40%"
 RATE = "+28%"
-MINION_PHRASES = ("Bello!", "Papoy!", "Bee-do-bee-do-bee-do!", "Ta-ta!",
-                  "Banana!", "Underwear!")
 
 _voice_lock = threading.Lock()          # one utterance at a time, robot-wide
 
@@ -54,10 +54,13 @@ _voice_lock = threading.Lock()          # one utterance at a time, robot-wide
 def ssml(text):
     """The Minion SSML for `text` — the one definition of how a sentence sounds.
 
-    A leading interjection is part of the voice, not part of the caller's text,
-    so it is added here and the caller keeps speaking the words it meant.
+    The words are not the caller's English: they are the Minionese that
+    ``minionese.py`` makes of it, opening word included, so a sentence the robot
+    is asked to say comes out in the corpus's own language.  The caller keeps the
+    meaning it meant; if there is no corpus the text is spoken as it stands
+    rather than dropped.
     """
-    spoken = "%s %s" % (random.choice(MINION_PHRASES), text)
+    spoken = minionese.speak(text)
     return (spoken,
             '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">'
             '<voice name="%s"><prosody pitch="%s" rate="%s">%s</prosody></voice></speak>'

@@ -31,6 +31,8 @@ set -u
 ROBOT_HOST="${ROBOT_HOST:-ws@192.168.24.25}"
 REMOTE_DIR="${REMOTE_DIR:-/home/ws/ugv_rpi}"
 WEIGHTS="${WEIGHTS:-yolov8n.pt}"      # eyes_gaze's default detector, also cv_ctrl's
+CORPUS="${CORPUS:-minionese_corpus.txt}"  # minionese.py trains its language from this
+ENGLISH="${ENGLISH:-minionese_english.txt}"  # the English side of the meanings it teaches in French
 # Fail in seconds on a wrong or sleeping host rather than hanging on a TCP SYN.
 SSH_OPTS=(-o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
 PY="${PYTHON:-python}"
@@ -144,9 +146,13 @@ PY_LIST="$(printf '%s\n' "$FILES" | grep -E '\.py$' | tr '\n' ' ')"
 if [ "$MODE" = "manifest" ]; then
   echo "# $COUNT local modules app.py reaches (transitively), from $HERE"
   printf '%s\n' "$FILES"
-  # Weights are a blob, not a module, so this list cannot show them.
+  # Weights and the corpus are files, not modules, so this list cannot show them.
   if [ -f "$WEIGHTS" ]; then echo "# weights: $WEIGHTS would ship too"
   else echo "# weights: no $WEIGHTS here - the robot must have its own, or nobody is detected"; fi
+  if [ -f "$CORPUS" ]; then echo "# corpus: $CORPUS would ship too"
+  else echo "# corpus: no $CORPUS here - the robot would speak plain English"; fi
+  if [ -f "$ENGLISH" ]; then echo "# english side: $ENGLISH would ship too"
+  else echo "# english side: no $ENGLISH here - the meanings the corpus teaches in French stay unreachable from English"; fi
   exit 0
 fi
 
@@ -184,6 +190,19 @@ if [ -f "$WEIGHTS" ]; then
     || { echo "[deploy] weights transfer failed" >&2; exit 1; }
 fi
 
+# ── the Minionese corpus, and its English side ──────────────────────────────
+# Data again, and load-bearing: minionese.py trains its table, its start
+# distribution and its character model from the corpus at import, so a robot
+# without it says the caller's English out loud instead of Minionese.  The
+# English column is the second half of the same data - the meanings the corpus
+# teaches only in French - and a robot without it invents "please" instead of
+# saying Moka, so it ships the same way.
+for DATA in "$CORPUS" "$ENGLISH"; do
+  [ -f "$DATA" ] || continue
+  tar czf - "$DATA" | ssh "${SSH_OPTS[@]}" "$ROBOT_HOST" "cd '$REMOTE_DIR' && tar xzf - && echo '[deploy] data shipped: $DATA'" \
+    || { echo "[deploy] $DATA transfer failed" >&2; exit 1; }
+done
+
 # ── check the far side, and say plainly whether the gaze is there ────────────
 printf '%s\n' "$FILES" | ssh "${SSH_OPTS[@]}" "$ROBOT_HOST" "
   cd '$REMOTE_DIR' || exit 1
@@ -197,6 +216,8 @@ printf '%s\n' "$FILES" | ssh "${SSH_OPTS[@]}" "$ROBOT_HOST" "
   \$P -m py_compile $PY_LIST || { echo '[check] a module does not compile on the robot' >&2; exit 1; }
   echo '[check] all modules compile on the robot'
   \$P -c 'import eyes_gaze; print(\"[check] gaze module importable:\", eyes_gaze.__file__)'
+  \$P -c 'import minionese; L = minionese.LANGUAGE; print(\"[check] minionese trained:\", (len(L.table), len(L.vocab)) if L else \"NO CORPUS (\\\"$CORPUS\\\" missing) - it would speak plain English\")'
+  \$P -c 'import minionese as m; L = m.LANGUAGE; b = lambda s: s.strip(\".,!?\").lower(); c = {b(x) for x, _ in L.entries}; e = {b(x) for x, _ in L.english}; print(\"[check] english side covers:\", len(c & e), \"of\", len(c), \"meanings\", \"MISSING \" + str(sorted(c - e)[:3]) if c - e else \"\")'
   if [ -f '$WEIGHTS' ]; then
     echo '[check] gaze weights present: $WEIGHTS'
   else

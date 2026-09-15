@@ -403,10 +403,12 @@ robot spoke in two voices. There is one owner now:
 
 | piece | owns |
 |---|---|
-| `voice.py` | the voice: the Azure credential, the SSML (Minion pitch and rate plus a leading interjection), synthesis over REST (the SDK's WebSocket fails after a reboot while HTTPS works), `paplay`, the local fallback, and the robot-wide lock that stops two sentences talking over each other. A definition, not a choice: there were four presets with a `POST /voice` picker that no UI could reach and nobody asked for, so that surface is gone. |
+| `voice.py` | the voice: the Azure credential, the SSML (pitch and rate that make the register), synthesis over REST (the SDK's WebSocket fails after a reboot while HTTPS works), `paplay`, the local fallback, and the robot-wide lock that stops two sentences talking over each other. A definition, not a choice: there were four presets with a `POST /voice` picker that no UI could reach and nobody asked for, so that surface is gone. |
+| `minionese.py` | **what is said**: the words, trained at import from `minionese_corpus.txt` (see below). It used to be six hardcoded interjections glued in front of the caller's English here, which is English in a costume, not Minionese. |
 | `face_screen.py` | the face on the robot's **own 800×480 panel**: it polls `/speech_status` a few times a second and indexes the same curve at 60 fps, so the app does no drawing and the two faces cannot drift. It is a second process (it owns a display), so it is not a module `app.py` imports. |
 | `start_face.sh` | the whole lifecycle — `bash start_face.sh`, `--stop`, `--status`, `--selftest`. No caller may spell `face_screen.py` in the same shell as a `--stop`: the module's name in that shell's own command line makes `pkill -f` kill the shell, which looks exactly like a dead robot (no output, exit 255). Measured twice. |
 | `deploy.sh` `EXTRA` | the two files above ship even though nothing imports them; the module set stays derived from `app.py`'s imports, and a file with no importer has to be named explicitly. The far-side `py_compile` is fed only the `.py` files — passing it the bash launcher printed a SyntaxError and, with no `set -e` remotely, still exited 0. |
+| `deploy.sh` `CORPUS` / `ENGLISH` | `minionese_corpus.txt` and `minionese_english.txt` ship like the weights do, for the same reason: they are data the manifest cannot find. One deploy was watched writing **no** corpus while reporting every module present — the app then says the caller's English — so the far side now prints what the model trained to (`[check] minionese trained: (353, 107)`) and how much of it English reaches (`[check] english side covers: 100 of 100 meanings`) rather than only listing files. |
 
 Measured on the panel (captured with **grim** — this session is labwc, so the X
 root that `scrot` grabs is black while the composited output is not): idle
@@ -415,9 +417,103 @@ correlation against the robot's own published level **+0.89**; the widest frame
 drew 143 px where the model predicts 136. The caption appears only while
 speaking (0 → 1,405 caption pixels), so the panel shows the words as well. The
 app's own command line reaches the same voice: `POST /send_command` with
-`command=audio -s Lights activated` produces the envelope text
-**"Bee-do-bee-do-bee-do! Lights activated"**, measured from real audio (186
-frames).
+`command=audio -s Lights activated` speaks **"Sos poohanan nonnichu"** — Minionese
+through a second entry point, so the language is not wired into `/api/say` alone.
+
+### Minionese: the language, trained from the user's corpus (Sep 15)
+
+Six hardcoded interjections in front of the caller's English is English in a
+costume. The user supplied the vocabulary and the dialogue, so the words are now
+learned from it:
+
+| piece | owns |
+|---|---|
+| `minionese_corpus.txt` | the user's own data: the film's dialogue, a Minion–English list and a Minion–French one. Shipped by `deploy.sh` like the weights, because the manifest cannot find a data file. |
+| `minionese_english.txt` | the English side of the corpus's own 100 meanings, because part of the corpus is taught only in French (`Moka : S'il vous plaît`, `Grazi : Merci`) and an English speaker could not reach those at all. Data, shipped like the corpus; it supplies no words and no openings of its own. |
+| `minionese.py` | the training pass, at import, and what it yields: the **table** (124 corpus pairs + 100 English meanings → 353 keys), the **parsed corpus** (`entries`) and its **English column** (`english`) — what makes the reachability check testable against the source rather than against its own keys — the **start distribution** (101 opening words, sampled from the corpus instead of a hardcoded list), and an **order-3 character model backed off to order 2** (107 Minionese words) that builds a word the table has never seen, seeded by that English word so it is stable. `voice.py` is the only caller. |
+| `minionese_selftest.py` | 87 checks: every one of the corpus's 124 entries reachable from its own taught words, the English column covering every corpus meaning and reaching only Minionese the corpus taught, that a taught word means one thing alone and in a sentence, the numerals, the dropped articles and copulas, the character model's shape and stability, the openings, the edge cases, and that `voice.ssml` really speaks Minionese. |
+
+Three parsing defects came out of testing rather than reading: the dash rule was
+eating the hyphen in `Bi-do` and splitting it into a nonsense pair; the block's
+French section headings are pasted with no separator, so they glued onto the
+preceding translation and silently cost the numerals 4–10; and an unbounded
+character walk produced twelve-character mush (`bonononjoutt`) until it was
+bounded to 4–8 letters ending open.
+
+Live on the robot — through the app's own path, Azure WAV played, and no fallback
+in the log:
+
+| asked | spoken |
+|---|---|
+| `The battery is low, please charge me.` | `Tulaliloo kissupay kapayego, piperwea dokapota me.` |
+| `Hello! Thank you for the banana.` | `Matoka bello! Tank yu nananana banana.` |
+| `I see a person three metres ahead.` | `Pika kononono kyupayee megamoku sae chocolok konnionn.` |
+| `audio -s Lights activated` (app command) | `Sos poohanan nonnichu` |
+
+The panel animated every one (mouth 87 px closed → 283 px open, caption ink on
+screen), and `three` → `sae` shows the numerals surviving inside a sentence.
+### The whole corpus is reachable from English (Sep 15)
+
+Indexing only the corpus's translation side left words it plainly teaches
+unreachable, so every entry is now reachable from **both** sides: the taught side
+becomes a key (English *and* French, because the corpus teaches both), and a word
+that exactly one entry uses resolves to that entry's Minionese — which is how
+`sorry` (from `I'm sorry`) reaches `Bi-do` and `hungry` (`I'm hungry`) reaches
+`Me want banana` instead of being invented. A word several entries would answer
+with (`you`) is left to the invented path rather than resolved by whichever entry
+came first, and the longest taught phrase always wins the match, so a phrase is
+never read word by word.
+
+Measured against the corpus itself, not against the table it built:
+
+| measurement | result |
+|---|---|
+| corpus entries whose taught side failed to become a key | **0 / 124** |
+| entries whose key translates to something other than that entry's Minionese | **0** |
+| taught keys that drift between alone and inside a sentence | **0 / 228** (and 0 with the English column, which is checked in the suite) |
+| taught words the corpus repeats for different Minionese (`bonjour`: Bello, Aloha, Konnichiwa) | 2, resolved by the first entry — deterministic, so a word still means one thing |
+
+Live, several taught words in one sentence through `/api/say`:
+`Hello! Sorry, I am hungry. Stop, thank you, goodbye. One apple, look!` →
+**`Idiot bello! Bi-do, muakazik Me want banana. Stupa, Tank yu, Poopaye. Hana Bapple, Luk at tu!`**
+— 9/9 taught words reached, panel animated 83 → 255 px with 2,588 caption pixels
+of ink. The app's *other* entry point speaks it too: `POST /send_command` with
+`command=audio -s Hello, sorry, goodbye, please` → **`Zzz bello, Bi-do, Poopaye,
+laloopay`** (90 mouth frames published, peak open 0.78).
+
+### The English side of the corpus's own meanings (Sep 15)
+
+That paragraph was the gap the user then named: the corpus teaches some meanings
+only in French, so an English speaker saying "please" got an invented word while
+the corpus plainly teaches `Moka`. The fix is data, not a wider model —
+`minionese_english.txt` gives every one of the corpus's 100 meanings its English
+words, and `minionese.py` trains it the same way, merged so the corpus wins any
+key it taught itself. The column supplies **no words and no openings**: its
+Minionese side is the corpus's, and the suite proves it reaches nothing the corpus
+did not teach.
+
+Two defects came out of training it, both found by checks rather than by reading,
+and both are regressions the column introduced:
+
+| what happened | the fix |
+|---|---|
+| a colon in the column's own header parsed as an entry and was learned as a word (`french (moka`) | the coverage check compares the column's meanings to the corpus's as a **set**, so a stray line can no longer survive |
+| the column's *fragments* claimed phrases — `battery` answered `Pip pip pip` from `low battery` — and the character model had nothing to invent | only the **corpus** indexes words (that is what makes `sorry` → `Bi-do`); the column indexes whole meanings |
+| Minionese the corpus already speaks was re-translated — `Kiss kiss` came out `Kiss kiss Kiss kiss`, because `kiss` is now an English key | a one-word key that is already Minionese vocabulary is left alone |
+
+Measured, live, on the robot through `/api/say` (12/12 taught words reached,
+panel animating on every sentence, peak opening 0.83–0.84):
+
+| asked | spoken |
+|---|---|
+| `Please, thank you, goodbye.` | `Hehehe moka, Tank yu, Poopaye.` |
+| `Sorry! You're welcome. Let's go, follow me, listen.` | `Luk bi-do! Prego. Vamo, Chupa, Tara.` |
+| `Hello! Ten apples, four bananas, low battery.` | `Loka bello! Ju bokamoka, Chari harazapo, Pip pip pip.` |
+
+Named gaps: a **plural** is still invented (`apples` → `bokamoka`) because the
+corpus teaches the singular — reaching plurals means stemming, which is a wider
+model than the words the corpus supplies; and the caption shows the Minionese, so
+the English meaning lives only where the caller asked for it.
 
 Boot: the `@reboot` entry is **installed from the repo**, not hand-written.
 `bash deploy.sh` ships `start_face.sh` and then asks it to `--install-boot`, so a

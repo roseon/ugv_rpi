@@ -1,0 +1,113 @@
+The English side of every meaning minionese_corpus.txt teaches.
+
+The corpus teaches some meanings in English (Bello - Hello) and others only in
+French (Moka, Grazi, Prego), so an English speaker could not reach those and the
+words came out invented. Each line below is one Minionese meaning with the English
+words that mean it, slash-separated like the corpus's own "Bonjour / Salut". The
+corpus still supplies every word and picks the openings; this file only says which
+English words reach a meaning it already teaches.
+
+Keep this header free of the division mark used below - the parser reads every
+line that carries one as an entry, and a stray mark here becomes a learned word.
+That happened once, with the header reading "French (Moka - S'il vous plait)".
+
+Bello : hello / hi
+Ayoo : hey
+Poopaye : goodbye / bye
+Tank yu : thank you / thanks
+Bi-do : sorry / i'm sorry / excuse me
+Sa la ka : how dare you / how are you
+Poka : what / see you soon / catch / arm
+Stupa : stop
+Tulaliloo ti amo : we love you / i love you
+Kiss kiss : kiss / kisses
+Para tu : for you
+Luk at tu : look at you / look at yourself
+Me want banana : i'm hungry / i am hungry
+Underwear : i swear
+Hana : one
+Dul : two
+Sae : three
+Bee do bee do bee do : fire / alarm / emergency
+Baboi : toy / plush
+Bapple : apple
+Gelato : ice cream
+La boda : marriage / wedding / party
+Kanpai : cheers
+Buttom : bottom
+Grazi : thank you / thanks
+Prego : you're welcome
+Moka : please / window
+Aloha : hello / welcome
+Konnichiwa : good afternoon
+Chari : four
+Mit : five
+Go : six
+Roku : seven
+Nana : eight
+Kyu : nine
+Ju : ten
+Muak muak muak : kiss / to kiss
+Vamo : let's go / go on / forward
+Cula : back up / reverse
+Toka : touch
+Doka : push
+Buka : open
+Kika : hit / punch
+Banana : banana / food
+Potato : potato
+Chocola : chocolate
+Yakitori : chicken
+Papaya : papaya
+Pancit : noodles
+Kampai : cheers / drink
+Bido : robot / machine
+Lika : mirror / image
+Kaka : trash / dirt
+Wika : paper
+Tika : watch / time
+Pika : light
+Goka : door
+Soka : chair
+Hehehe : laugh / joy / funny
+Bwahaha : evil laugh
+Oh : surprise
+Aieee : fear / pain / ouch
+Hmm : thinking / hmm
+Yay : celebration / success / hooray
+Ooh : wonder / wow
+Grrr : anger / frustrated
+Pff : bored / bored now
+Zzz : sleep / sleeping
+Tulaliloo : attention / alert
+Whaaa : danger
+Bata : attack / fight
+Matoka : target locked / look at that
+Bompa : explosion / boom
+Kapoof : gone / off
+Pip pip pip : low battery
+Flash : flash / bright light
+Sos : help / sos
+Butt : butt / back
+Oyu : eye / sensor
+Loka : hand / claw
+Tutu : leg / wheel
+Koko : head / processor
+Boka : mouth / speaker
+Nono : nose
+Lolo : ear / microphone
+Po ka : what
+Si : yes
+No : no
+Idiot : idiot
+Chupa : follow me / come with me
+Pika pika : shiny / clean
+Labda : lab / base
+Boss : boss / master
+Minion : servant / minion
+Gru : gru / the big boss
+Mega : very big / powerful
+Mini : very small / tiny
+Super : excellent / super
+Tara : listen
+Kaza : home / charging station
