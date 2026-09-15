@@ -142,6 +142,12 @@ public class RobotState : System.ComponentModel.INotifyPropertyChanged
     EyesStatus _eyes = EyesStatus.NotPolled();
     public EyesStatus Eyes { get => _eyes; set { _eyes = value; Raise(nameof(Eyes)); } }
 
+    // ── the robot's mouth ──
+    // One owner for the last /speech_status. The Face panel draws from this and
+    // names a broken link from it, instead of polling the robot again.
+    SpeechStatus _speech = SpeechStatus.NotPolled();
+    public SpeechStatus Speech { get => _speech; set { _speech = value; Raise(nameof(Speech)); } }
+
     // ── learning ──
     public string LearnStatus = "idle";
     public void Note(string msg) => LearnStatus = msg;

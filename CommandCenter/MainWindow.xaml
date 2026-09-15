@@ -25,6 +25,9 @@
                 <TextBlock Text="Command Center v1.0" Foreground="#FF546E7A" VerticalAlignment="Center" HorizontalAlignment="Right"/>
             </DockPanel>
         </Border>
+        <!-- The robot's face rides above the tabs: it is visible whatever page is
+             open, and its big window can come up by itself when the robot talks. -->
+        <p:FaceBar x:Name="Face" DockPanel.Dock="Top"/>
         <TabControl Background="Transparent" BorderThickness="0">
             <TabItem Header="🕹 Drive"><p:DrivePanel x:Name="DriveTab"/></TabItem>
             <TabItem Header="📡 Radar"><p:RadarPanel x:Name="RadarTab"/></TabItem>

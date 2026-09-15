@@ -26,6 +26,7 @@ public sealed class RobotClient : IAsyncDisposable
         _cts.Cancel();
         _cts = new CancellationTokenSource();
         State.Eyes = EyesStatus.NotPolled();   // never draw the previous robot's boxes
+        State.Speech = SpeechStatus.NotPolled();
         State.ConnDetail = $"connecting to {State.HostLabel} ...";
         Ctrl?.DisposeAsync().AsTask().Wait(200);
         Json?.DisposeAsync().AsTask().Wait(200);
@@ -53,6 +54,7 @@ public sealed class RobotClient : IAsyncDisposable
     public event Action<BitmapSource>? VideoFrame;
     public event Action? CamerasChanged;
     public event Action? EyesChanged;
+    public event Action? SpeechChanged;
     public event Action<double, double>? CommandSent;
 
     public BitmapSource? LastFrame { get; private set; }
@@ -99,6 +101,47 @@ public sealed class RobotClient : IAsyncDisposable
         }
         catch (Exception ex) { State.Eyes = EyesStatus.Unavailable(DescribeUnreachable(ex)); }
         EyesChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// Poll what the robot is saying. Cheap, and while it is speaking it brings
+    /// the whole envelope back, so the panel draws every syllable at display
+    /// rate from one poll instead of following a bare level over the wire.
+    /// </summary>
+    public async Task PollSpeechAsync(CancellationToken ct)
+    {
+        try
+        {
+            var j = await GetJsonAsync("/speech_status");
+            State.Speech = SpeechStatus.Parse(j);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+        catch (HttpRequestException h) when (h.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            State.Speech = SpeechStatus.NotDeployed();
+        }
+        catch (Exception ex) { State.Speech = SpeechStatus.Unavailable(DescribeUnreachable(ex)); }
+        SpeechChanged?.Invoke();
+    }
+
+    /// <summary>Make the robot speak. Throws with the robot's own reason if it will not.</summary>
+    public async Task SayAsync(string text)
+    {
+        using var content = new StringContent(
+            JsonSerializer.Serialize(new { text }), System.Text.Encoding.UTF8, "application/json");
+        var resp = await _http.PostAsync(State.BaseUrl + "/api/say", content, _cts.Token);
+        if (!resp.IsSuccessStatusCode)
+        {
+            string msg = $"the robot refused to speak (HTTP {(int)resp.StatusCode})";
+            try
+            {
+                using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(_cts.Token));
+                if (doc.RootElement.TryGetProperty("message", out var m))
+                    msg = m.GetString() ?? msg;
+            }
+            catch { }
+            throw new InvalidOperationException(msg);
+        }
     }
 
     public Task<JsonElement> RetryCameraAsync() => PostFormAsync("/retry_camera", new Dictionary<string, string>());
@@ -302,11 +345,20 @@ public sealed class RobotClient : IAsyncDisposable
         var lidarTimer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
         var statusTimer = new PeriodicTimer(TimeSpan.FromSeconds(2));
         var eyesTimer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
+        // Faster than the eyes: the mouth has to notice a sentence starting, and
+        // the envelope is what keeps it in time once it has.
+        var speechTimer = new PeriodicTimer(TimeSpan.FromMilliseconds(250));
 
         _ = Task.Run(async () =>
         {
             while (await eyesTimer.WaitForNextTickAsync(ct))
                 await PollEyesAsync(ct);
+        });
+
+        _ = Task.Run(async () =>
+        {
+            while (await speechTimer.WaitForNextTickAsync(ct))
+                await PollSpeechAsync(ct);
         });
 
         _ = Task.Run(async () =>

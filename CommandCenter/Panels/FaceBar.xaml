@@ -1,0 +1,50 @@
+<UserControl x:Class="CommandCenter.Panels.FaceBar"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:p="clr-namespace:CommandCenter.Panels">
+    <Border Style="{StaticResource PanelCard}" Margin="6,4,6,2" Padding="8,6">
+        <Grid>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- The mouth itself, always on screen: this panel is docked above the
+                 tabs, so the robot's face is visible on every one of them. -->
+            <p:MouthView x:Name="Mouth" Grid.Column="0" Width="132" Height="58" Margin="0,0,12,0"/>
+
+            <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="0,0,12,0">
+                <TextBlock x:Name="FaceLink" Text="no robot" FontWeight="Bold"
+                           Foreground="#FFB0BEC5" FontSize="12"/>
+                <Border Background="#FF1B1E23" Height="7" Width="150" CornerRadius="4" Margin="0,4,0,0">
+                    <Border x:Name="LevelFill" Background="#FF4FF5C0" Width="0"
+                            HorizontalAlignment="Left" CornerRadius="4"/>
+                </Border>
+            </StackPanel>
+
+            <DockPanel Grid.Column="2" VerticalAlignment="Center">
+                <Button x:Name="SayBtn" Content="🔊 Speak" Style="{StaticResource OpButton}"
+                        DockPanel.Dock="Right" Width="100" Click="OnSay"/>
+                <TextBox x:Name="SayBox" Background="#FF1B1E23" Foreground="White"
+                         BorderBrush="#FF37474F" Padding="6,5" VerticalContentAlignment="Center"
+                         KeyDown="OnSayKey"/>
+            </DockPanel>
+
+            <StackPanel Grid.Column="3" VerticalAlignment="Center" Orientation="Horizontal" Margin="8,0,0,0">
+                <Button Content="Hello!" Style="{StaticResource OpButton}" Tag="Hello!" Click="OnQuick"/>
+                <Button Content="Yes" Style="{StaticResource OpButton}" Tag="Yes." Click="OnQuick"/>
+                <Button Content="Nice to meet you" Style="{StaticResource OpButton}"
+                        Tag="Nice to meet you, I am Lance." Click="OnQuick"/>
+                <Button x:Name="BigBtn" Content="⤢ Big face" Style="{StaticResource OpButton}"
+                        Click="OnToggleBig" ToolTip="Open the face in its own window"/>
+                <CheckBox x:Name="AutoFace" Content="open it when it talks" IsChecked="True"
+                          Foreground="#FFB0BEC5" VerticalAlignment="Center" Margin="8,0,4,0"
+                          ToolTip="When the robot starts speaking, show the big face on top"/>
+                <TextBlock x:Name="SayNote" Text="" Foreground="#FFFFAB91" VerticalAlignment="Center"
+                           Margin="8,0,0,0" MaxWidth="260" TextTrimming="CharacterEllipsis"/>
+            </StackPanel>
+        </Grid>
+    </Border>
+</UserControl>

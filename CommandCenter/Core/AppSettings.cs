@@ -19,6 +19,7 @@ public static class AppSettings
     static readonly string _dir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "UGVCommandCenter");
     static readonly string _file = Path.Combine(_dir, "host.txt");
+    static readonly string _faceFile = Path.Combine(_dir, "face.txt");
 
     /// <summary>Remembered address, or the default when nothing is stored.</summary>
     public static string LoadHost()
@@ -49,6 +50,40 @@ public static class AppSettings
         catch
         {
             // Not being able to remember it is not worth failing a connection over.
+        }
+    }
+
+    /// <summary>Where the face window was left, or null when it has never been moved.</summary>
+    public static (double Left, double Top)? LoadFacePlacement()
+    {
+        try
+        {
+            if (File.Exists(_faceFile))
+            {
+                var parts = File.ReadAllText(_faceFile).Split(',');
+                if (parts.Length == 2
+                    && double.TryParse(parts[0], out var left)
+                    && double.TryParse(parts[1], out var top))
+                    return (left, top);
+            }
+        }
+        catch
+        {
+            // As with the address: a settings file that cannot be read is not fatal.
+        }
+        return null;
+    }
+
+    /// <summary>Remember where the face window was left.</summary>
+    public static void SaveFacePlacement(double left, double top)
+    {
+        try
+        {
+            Directory.CreateDirectory(_dir);
+            File.WriteAllText(_faceFile, $"{left},{top}");
+        }
+        catch
+        {
         }
     }
 }
