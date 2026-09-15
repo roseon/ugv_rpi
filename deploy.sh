@@ -16,10 +16,15 @@
 #
 # Not modules, and deliberately not in this set: config.yaml and templates/,
 # which the app reads at runtime and which are already on the robot.
+#
+# The detector's weights ship too when they are here.  They are not importable
+# code, so the manifest cannot find them, and ultralytics would fetch them from
+# GitHub on first use - which a robot with no route there cannot do.
 set -u
 
 ROBOT_HOST="${ROBOT_HOST:-ws@192.168.24.25}"
 REMOTE_DIR="${REMOTE_DIR:-/home/ws/ugv_rpi}"
+WEIGHTS="${WEIGHTS:-yolov8n.pt}"      # eyes_gaze's default detector, also cv_ctrl's
 # Fail in seconds on a wrong or sleeping host rather than hanging on a TCP SYN.
 SSH_OPTS=(-o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
 PY="${PYTHON:-python}"
@@ -123,6 +128,9 @@ LIST="${FILES//$'\n'/ }"          # one line, for the places that need arguments
 if [ "$MODE" = "manifest" ]; then
   echo "# $COUNT local modules app.py reaches (transitively), from $HERE"
   printf '%s\n' "$FILES"
+  # Weights are a blob, not a module, so this list cannot show them.
+  if [ -f "$WEIGHTS" ]; then echo "# weights: $WEIGHTS would ship too"
+  else echo "# weights: no $WEIGHTS here - the robot must have its own, or nobody is detected"; fi
   exit 0
 fi
 
@@ -152,6 +160,14 @@ printf '%s\n' "$FILES" | ssh "${SSH_OPTS[@]}" "$ROBOT_HOST" "
 tar czf - $FILES | ssh "${SSH_OPTS[@]}" "$ROBOT_HOST" "cd '$REMOTE_DIR' && tar xzf - && echo '[deploy] files extracted'" \
   || { echo "[deploy] transfer failed" >&2; exit 1; }
 
+# ── the detector's weights ───────────────────────────────────────────────────
+# A blob, not a module: its own tar, never passed to py_compile.  Absent locally
+# it is simply not shipped, and the far-side check below says so out loud.
+if [ -f "$WEIGHTS" ]; then
+  tar czf - "$WEIGHTS" | ssh "${SSH_OPTS[@]}" "$ROBOT_HOST" "cd '$REMOTE_DIR' && tar xzf - && echo '[deploy] weights shipped: $WEIGHTS'" \
+    || { echo "[deploy] weights transfer failed" >&2; exit 1; }
+fi
+
 # ── check the far side, and say plainly whether the gaze is there ────────────
 printf '%s\n' "$FILES" | ssh "${SSH_OPTS[@]}" "$ROBOT_HOST" "
   cd '$REMOTE_DIR' || exit 1
@@ -164,19 +180,36 @@ printf '%s\n' "$FILES" | ssh "${SSH_OPTS[@]}" "$ROBOT_HOST" "
   [ \$missing -eq 0 ] && echo '[check] every module present'
   \$P -m py_compile $LIST && echo '[check] all modules compile on the robot'
   \$P -c 'import eyes_gaze; print(\"[check] gaze module importable:\", eyes_gaze.__file__)'
+  if [ -f '$WEIGHTS' ]; then
+    echo '[check] gaze weights present: $WEIGHTS'
+  else
+    echo '[check] gaze weights MISSING: no person can be detected - put $WEIGHTS in $REMOTE_DIR'
+  fi
   if [ \$missing -ne 0 ]; then exit 1; fi
 " || { echo "[deploy] the far side is missing modules or cannot import the gaze - not restarting" >&2; exit 1; }
 
 # ── restart as exactly one process ───────────────────────────────────────────
-# The pattern is bracketed ([a]pp\.py) so pgrep cannot match this very command,
-# which is how an earlier deploy killed its own shell before it could run.
+# pgrep -f matches the whole command text, and this whole command text travels
+# in the remote shell's argv: measured on the robot, 'pgrep -af' listed its own
+# 'bash -c ...' line right beside the app.  The bracket in '[a]pp\.py' hides only
+# the pattern itself, so the launch line below must not spell the name either -
+# otherwise pkill kills the very shell that was going to do the restart.
 if [ "$RESTART" = 1 ]; then
   ssh "${SSH_OPTS[@]}" "$ROBOT_HOST" "
     cd '$REMOTE_DIR' || exit 1
+    script=\"ap\"\"p.py\"
     pkill -f '[a]pp\.py' 2>/dev/null
     sleep 2
+    # Measured: the app does not exit on SIGTERM (still on port 5000 six seconds
+    # later), so a plain pkill leaves the old process owning the camera while the
+    # new one starts against a busy device.  Escalate instead of stopping short.
+    if pgrep -f '[a]pp\.py' >/dev/null; then
+      echo '[deploy] the running app ignored SIGTERM - escalating to SIGKILL'
+      pkill -9 -f '[a]pp\.py' 2>/dev/null
+      sleep 3
+    fi
     if ! pgrep -f '[a]pp\.py' >/dev/null; then
-      nohup ./ugv-env/bin/python app.py >> app.log 2>&1 </dev/null &
+      nohup ./ugv-env/bin/python \"\$script\" >> app.log 2>&1 </dev/null &
       sleep 4
     fi
     n=\$(pgrep -cf '[a]pp\.py')
