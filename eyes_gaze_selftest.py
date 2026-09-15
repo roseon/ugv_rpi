@@ -49,11 +49,25 @@ class FakeCvf:
         self._latest_raw_frame = frame
 
 
+class _Pixels:
+    """What one sampled frame location looks like to the freshness check."""
+
+    def __init__(self, v):
+        self.v = v
+
+    def tobytes(self):
+        return bytes([self.v & 0xFF])
+
+
 class FakeFrame:
-    """Just enough frame for shape[:2] — the injected detector ignores pixels."""
+    """Just enough frame: a shape, and one constant sample.  The injected detector
+    ignores pixels, so only the gaze's own freshness check reads them."""
 
     def __init__(self, w=640, h=480):
         self.shape = (h, w, 3)
+
+    def __getitem__(self, _key):
+        return _Pixels(0)
 
 
 class FakeLink:
@@ -121,6 +135,20 @@ check("a named object outranks a merely-near wall", why == "camera")
 px, py, why = choose_gaze((300.0, 0.0), cam_left, 1200.0, 450.0)
 check("something genuinely too close overrides the camera",
       why == "lidar_close", f"got {why}")
+
+# The state the live robot was in: nearest LIDAR return 343 mm at 177.8 deg —
+# behind it — while the camera had a person.  It pinned both pupils at px 0.
+BEHIND_CLOSE = (343.0, 177.8)
+px, py, why = choose_gaze(BEHIND_CLOSE, cam_left, 1200.0, 450.0)
+check("a close obstacle BEHIND does not outrank the camera",
+      (px, py, why) == (25, 30, "camera"), f"got px={px} py={py} why={why}")
+for mm, bearing in ((343.0, 177.8), (900.0, 177.8), (300.0, -179.0)):
+    px, py, why = choose_gaze((mm, bearing), None, 1200.0, 450.0)
+    check(f"an obstacle {mm:.0f} mm at {bearing} deg shows nothing, not a clamped edge",
+          (px, py, why) == (None, None, "idle"), f"got px={px} why={why}")
+px, py, why = choose_gaze((300.0, 60.0), cam_left, 1200.0, 450.0)
+check("a close obstacle exactly at the screen edge still shows",
+      (px, py, why) == (0, 50, "lidar_close"), f"got px={px} why={why}")
 
 # ── nearest_obstacle ──────────────────────────────────────────────────────────
 empty = types.SimpleNamespace(angles=[], distances=[])
@@ -267,6 +295,38 @@ check("with two people the nearer/larger one is followed",
       (st["target"] or {}).get("px", 50) < 45, f"got {st['target']}")
 check("both people are counted", st["camera_persons"] == 2,
       f"got {st['camera_persons']}")
+
+
+# The seam this answers: with two people in frame the stronger box is regularly
+# not the one being followed, so a viewer that infers the confidence from the
+# label alone reports a number that contradicts the gaze it is describing.
+def two_people_uneven(_frame):
+    return [{"name": "person", "conf": 0.44, "box": (40, 60, 440, 420)},     # larger
+            {"name": "person", "conf": 0.93, "box": (480, 120, 560, 200)}]   # stronger
+
+
+link = FakeLink()
+g = make_gazer(link, frame=FakeFrame(640, 480), detector=two_people_uneven, cam_hz=2.0)
+st = g.step(now=1.0)
+check("the larger box is followed even though the other is more confident",
+      st["camera_conf"] == 0.44, f"got {st['camera_conf']}")
+check("...and that confidence belongs to the box the gaze points from",
+      (st["target"] or {}).get("px") == 44, f"got {st['target']}")
+check("the whole frame is still published, strongest box included",
+      [d["conf"] for d in st["detections"]] == [0.44, 0.93], f"got {st['detections']}")
+
+seen = {"hits": [{"name": "person", "conf": 0.91, "box": (160, 120, 320, 240)}]}
+link = FakeLink()
+g = make_gazer(link, frame=FakeFrame(640, 480),
+               detector=lambda _f: seen["hits"], cam_hz=2.0)
+check("a detection publishes its chosen confidence",
+      g.step(now=1.0)["camera_conf"] == 0.91)
+seen["hits"] = []                    # the person walks out of frame
+st = g.step(now=1.6)
+check("with nothing detected the chosen confidence is cleared",
+      st["camera_conf"] is None, f"got {st['camera_conf']}")
+check("...so the payload never claims a label it no longer has",
+      st["camera"] is None and st["detections"] == [], f"got {st['camera']}")
 
 
 def only_objects(_frame):
@@ -452,6 +512,186 @@ for v in ("", "maybe", "2"):
     except ValueError:
         check(f"enable={v!r} is rejected rather than inverted", True)
 
+# ── what the camera publishes, and what happens when it cannot see ───────────
+# /eyes_status is the only window into the gaze from outside the robot, so the
+# three things that decide whether a person can be followed at all have to be in
+# it: frames are arriving, a model loaded, and here are the boxes.
+
+class _Clock:
+    """A clock the test moves by hand."""
+
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+    def tick(self, dt):
+        self.t += dt
+
+
+def person_detector(_frame):
+    return [{"name": "person", "conf": 0.91, "box": (320, 96, 480, 384)}]
+
+
+clock = _Clock(1.0)
+link = FakeLink()
+g = EyeGazer(FakeBase((), ()), FakeCvf(FakeFrame(640, 480)), link=link,
+             detector=person_detector, cam_hz=2.0, clock=clock)
+st = g.step(now=1.0)
+check("the frame age is reported", st["frame_age_s"] == 0.0, f"got {st['frame_age_s']}")
+check("every detection is published, not only the chosen one",
+      len(st["detections"]) == 1, f"got {st['detections']}")
+d = st["detections"][0]
+check("a published box is a fraction of the frame, so a viewer can draw it",
+      d["box"] == [0.5, 0.2, 0.75, 0.8], f"got {d['box']}")
+check("a published detection says whether it is a person",
+      d["person"] is True and d["name"] == "person", f"got {d}")
+check("the chosen box is the one the gaze points at",
+      st["camera"] == "person" and (st["target"] or {}).get("px", 50) > 50,
+      f"got {st['camera']} {st['target']}")
+
+check("a box outside the frame is clamped to 0..1",
+      EyeGazer._normalise([{"name": "person", "conf": 0.5,
+                            "box": (-40, -40, 900, 700)}], FakeFrame(640, 480))[0]["box"]
+      == [0.0, 0.0, 1.0, 1.0])
+
+# A frame that stops changing is a dead capture loop.  Read as "empty camera"
+# it is wrong in both directions: the eyes point at a person who has walked away,
+# and nothing anywhere says the camera itself died.
+clock.tick(3.0)
+st = g.step(now=4.0)
+check("a frozen frame is reported as stale",
+      st["frame_age_s"] is not None and st["frame_age_s"] >= 3.0,
+      f"got {st['frame_age_s']}")
+check("...and the gaze says so itself, so a viewer never re-derives it",
+      st["frame_stale"] is True, f"got {st['frame_stale']}")
+check("a frozen frame does not drive a gaze", st["reason"] != "camera",
+      f"got {st['reason']}")
+check("a frozen frame publishes no detections", st["detections"] == [],
+      f"got {st['detections']}")
+
+
+class PixelFrame(FakeFrame):
+    """A frame whose sampled content the test can change underneath the gazer."""
+
+    def __init__(self, v=0):
+        super().__init__()
+        self.v = v
+
+    def __getitem__(self, _key):
+        return _Pixels(self.v)
+
+
+cvf = FakeCvf(PixelFrame(0))
+clock = _Clock(10.0)
+g = EyeGazer(FakeBase((), ()), cvf, link=FakeLink(), detector=person_detector,
+             cam_hz=2.0, clock=clock)
+g.step(now=10.0)
+clock.tick(3.0)
+cvf._latest_raw_frame.v = 200        # the picture changed, the object did not
+st = g.step(now=13.0)
+check("a camera backend that reuses one buffer is not read as a dead camera",
+      st["reason"] == "camera", f"got {st['reason']}")
+check("...and its frame age resets when the picture changes",
+      st["frame_age_s"] == 0.0, f"got {st['frame_age_s']}")
+check("...and a picture that is moving is not called stale",
+      st["frame_stale"] is False, f"got {st['frame_stale']}")
+
+clock.tick(3.0)
+st = g.step(now=16.0)                # now the pixels stop changing too
+check("a picture that genuinely stops changing is read as stale",
+      st["reason"] != "camera", f"got {st['reason']}")
+
+# The failure this answers: the eyes load their own YOLO, and when that load
+# fails the gaze silently follows LIDAR forever.  cv_ctrl loads the same weights
+# at boot, so the eyes borrow that model instead of losing the feature.
+import sys as _sys
+
+
+class _BrokenUltralytics(types.ModuleType):
+    """An ultralytics that cannot load weights (no internet, no file)."""
+
+    def __getattr__(self, name):
+        raise RuntimeError("weights are not on disk and there is no internet")
+
+
+_saved_ultra = _sys.modules.get("ultralytics")
+_sys.modules["ultralytics"] = _BrokenUltralytics("ultralytics")
+try:
+    cvf = FakeCvf(FakeFrame(640, 480))
+    cvf.yolo_model = _FakeYolo([_Box((400, 90, 560, 470), 0, 0.91)])   # the app's own
+    link = FakeLink()
+    g = EyeGazer(FakeBase((), ()), cvf, link=link, cam_hz=2.0, clock=lambda: 1.0)
+    st = g.step(now=1.0)
+    check("a failed model load is reported instead of silently disabling the gaze",
+          bool(st["model_error"]), f"got {st['model_error']!r}")
+    check("a person is still followed after the eyes' own load failed",
+          st["camera"] == "person" and st["target"] is not None,
+          f"got camera={st['camera']} target={st['target']}")
+
+    # Neither model available: the feature degrades, it does not break the eyes.
+    link = FakeLink()
+    g = EyeGazer(FakeBase(*scan_for(0.0, 300.0)), FakeCvf(FakeFrame(640, 480)),
+                 link=link, cam_hz=2.0, clock=lambda: 1.0)
+    st = g.step(now=1.0)
+    check("with no detector the status says so and the LIDAR gaze still works",
+          st["model_ready"] is False and bool(st["model_error"])
+          and st["reason"] == "lidar_close" and link.writes[-1] == b"T 50 50\n",
+          f"got ready={st['model_ready']} reason={st['reason']} {link.writes}")
+finally:
+    if _saved_ultra is not None:
+        _sys.modules["ultralytics"] = _saved_ultra
+    else:
+        _sys.modules.pop("ultralytics", None)
+
+# Stopping the gaze has to stop publishing what the camera last saw: a viewer
+# left drawing those boxes over a live stream, with `frame 0.0 s old` beside
+# them, is showing a picture of the past as if it were current.  The engine
+# decides that, not the viewer - so the fields go empty and `enabled` carries
+# the state.
+clock = _Clock(20.0)
+g = EyeGazer(FakeBase(*scan_for(0.0, 900.0)), FakeCvf(PixelFrame(0)), link=FakeLink(),
+             detector=person_detector, cam_hz=2.0, clock=clock)
+st = g.step(now=20.0)
+check("a running gaze publishes the boxes it just detected",
+      len(st["detections"]) == 1 and st["camera"] == "person", f"got {st}")
+g.stop()
+st = g.status(20.0)
+check("stop() publishes no detections to draw", st["detections"] == [],
+      f"got {st['detections']}")
+check("stop() publishes nothing the camera last saw",
+      st["camera"] is None and st["camera_conf"] is None
+      and st["camera_hits"] == 0 and st["camera_persons"] == 0,
+      f"got camera={st['camera']} conf={st['camera_conf']} hits={st['camera_hits']}")
+check("stop() publishes no frame age to read as live",
+      st["frame_age_s"] is None and st["frame_stale"] is False,
+      f"got age={st['frame_age_s']} stale={st['frame_stale']}")
+check("stop() says why those fields are empty",
+      st["enabled"] is False and st["reason"] == "stopped" and st["target"] is None,
+      f"got {st['enabled']} {st['reason']} {st['target']}")
+
+# The loop repeats that teardown as it exits, which is what covers a step still
+# inside a slow model load when stop() gave up waiting for it.
+clock = _Clock(30.0)
+g2 = EyeGazer(FakeBase((), ()), FakeCvf(PixelFrame(0)), link=FakeLink(),
+              detector=person_detector, cam_hz=2.0, clock=clock)
+g2.step(now=30.0)
+g2.stop()
+g2.step(now=31.0)                    # a restarted gaze publishes a live decision
+g2._enabled = True
+g2._park()                           # an older loop reaches its exit
+st = g2.status(31.0)
+check("an exiting loop does not clobber a restarted gaze",
+      st["reason"] == "camera" and len(st["detections"]) == 1,
+      f"got {st['reason']} {st['detections']}")
+g2._enabled = False
+g2._park()
+st = g2.status(30.0)
+check("the loop takes down what it published as it exits",
+      st["detections"] == [] and st["reason"] == "stopped" and st["target"] is None,
+      f"got {st['detections']} {st['reason']} {st['target']}")
+
 # ── the status payload must survive a strict JSON parser ──────────────────────
 import json as _json
 
@@ -464,6 +704,18 @@ try:
     check("status is strict-JSON clean", True)
 except ValueError as e:
     check("status is strict-JSON clean", False, f"invalid token {e!r}")
+
+# Detections and the frame age travel through the same payload, so they must be
+# strict-JSON clean too.
+link = FakeLink()
+g = make_gazer(link, frame=FakeFrame(640, 480), detector=person_detector, cam_hz=2.0)
+g.step(now=1.0)
+try:
+    _json.loads(_json.dumps(g.status(1.0)),
+                parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
+    check("status with detections is strict-JSON clean", True)
+except ValueError as e:
+    check("status with detections is strict-JSON clean", False, f"invalid token {e!r}")
 
 # ── summary ───────────────────────────────────────────────────────────────────
 print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} checks passed")

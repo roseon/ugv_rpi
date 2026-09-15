@@ -52,6 +52,11 @@ PERSON_LABELS = frozenset({"person", "people", "human"})
 # Nearest reading closer than this is treated as noise/self-return, not an object.
 MIN_OBSTACLE_MM = 60.0
 
+# A captured frame older than this means the capture loop stopped feeding us.
+# Gazing on a frozen frame points the eyes at a person who has already walked
+# away, and it is otherwise indistinguishable from "nobody in view".
+FRAME_STALE_S = 2.0
+
 # Send the same command again this often, so a dropped line or a reset Uno
 # catches up without waiting for the gaze to change.
 SEND_REPEAT_S = 1.0
@@ -124,13 +129,20 @@ def choose_gaze(lidar, camera, prox_mm, close_mm, screen_fov_deg=DEFAULT_SCREEN_
     ``lidar``  : (distance_mm, bearing_deg) | None
     ``camera`` : {'bearing_deg': float, 'py': int, 'name': str} | None
     Returns    : (px | None, py | None, reason)
+
+    Only a return the panels can actually point at takes the gaze.  A bearing
+    past +-screen_fov/2 has nowhere to go but a clamped edge, which tells the
+    user something is hard to the side when it is really behind them.  Live on
+    the robot a wall 343 mm *behind* it won that comparison and pinned both
+    pupils at the far left while the camera had a person at conf 0.88.
     """
-    if lidar is not None and lidar[0] <= close_mm:
+    reachable = lidar is not None and abs(lidar[1]) <= screen_fov_deg / 2.0 + 1e-6
+    if reachable and lidar[0] <= close_mm:
         return bearing_to_px(lidar[1], screen_fov_deg), 50, "lidar_close"
     if camera is not None:
         return (bearing_to_px(camera["bearing_deg"], screen_fov_deg),
                 camera.get("py", 50), "camera")
-    if lidar is not None and lidar[0] <= prox_mm:
+    if reachable and lidar[0] <= prox_mm:
         return bearing_to_px(lidar[1], screen_fov_deg), 50, "lidar_near"
     return None, None, "idle"
 
@@ -160,6 +172,7 @@ class EyeGazer:
         self._clock = clock
         self._model = None
         self._model_failed = False
+        self._model_error = None
 
         self._thread = None
         self._enabled = False
@@ -168,8 +181,13 @@ class EyeGazer:
         self._last_cam_t = 0.0
         self._cam_hit = None
         self._cam_label = None
+        self._cam_conf = None
         self._cam_raw_hits = 0
         self._cam_persons = 0
+        self._detections = []             # every hit this pass, boxes normalised
+        self._frame_sig = None
+        self._frame_change_t = 0.0
+        self._frame_age_s = None
 
         self._hold_px = None
         self._hold_py = None
@@ -235,7 +253,15 @@ class EyeGazer:
         return candidate if os.path.exists(candidate) else name
 
     def _model_instance(self):
-        """Load YOLOv8n once, lazily — never at import or in the app's boot path."""
+        """Load YOLOv8n once, lazily — never at import or in the app's boot path.
+
+        If this load fails the eyes cannot see a person at all, so it must not be
+        the end of the feature: ``cv_ctrl`` loads *the same weights* at boot and
+        keeps the model (``yolo_model``).  A second load can fail where that one
+        succeeded — no internet for ultralytics' first-run download, a second
+        instance, a version skew — and every previous failure here ended as a
+        single printed line and a gaze that silently followed LIDAR forever.
+        """
         if self._model is not None or self._model_failed:
             return self._model
         try:
@@ -243,6 +269,14 @@ class EyeGazer:
             self._model = YOLO(self.model_path)
         except Exception as e:                                  # noqa: BLE001
             self._model_failed = True
+            self._model_error = str(e)
+            shared = getattr(self.cvf, "yolo_model", None)
+            if shared is not None:
+                self._model = shared
+                self._model_failed = False
+                print(f"[eyes] own model load failed ({e}); "
+                      "using the detector the app already loaded")
+                return self._model
             print(f"[eyes] object model unavailable ({e}); gaze will follow LIDAR only")
         return self._model
 
@@ -262,46 +296,125 @@ class EyeGazer:
                              "box": (x1, y1, x2, y2)})
         return hits
 
+    @staticmethod
+    def _frame_signature(frame):
+        """A cheap fingerprint that changes when the picture does.
+
+        Content, not object identity, in both directions: a camera backend that
+        reuses one capture buffer would otherwise look like a dead camera, and a
+        genuinely frozen frame would look fresh.  Sampling every 64th pixel each
+        camera pass (a few hundred bytes at 2 Hz) catches both.
+        """
+        return (frame.shape, hash(frame[::64, ::64].tobytes()))
+
+    def _forget_frame(self):
+        """Forget the sampled frame, so no age is reported for one."""
+        self._frame_sig = None
+        self._frame_change_t = 0.0
+        self._frame_age_s = None
+
+    @property
+    def _frame_stale(self):
+        """This module's verdict on the frame, so a viewer never re-derives it.
+
+        It is published as ``frame_stale`` precisely so the panel does not need
+        its own copy of the threshold; a client that guesses gets it wrong in
+        both directions, calling a stopped camera "nobody in view" and a
+        stopped gaze "no camera frame".
+        """
+        return self._frame_age_s is not None and self._frame_age_s > FRAME_STALE_S
+
+    def _sample_frame(self, now):
+        """The freshest captured frame, and how long since it last changed.
+
+        The age is the only way to tell "nobody in view" from "the capture loop
+        stopped handing over frames": both look like an empty camera, and they
+        need opposite fixes.
+        """
+        frame = getattr(self.cvf, "_latest_raw_frame", None)
+        if frame is None:
+            self._forget_frame()
+            return None
+        sig = self._frame_signature(frame)
+        if sig != self._frame_sig:
+            self._frame_sig = sig
+            self._frame_change_t = now
+        self._frame_age_s = max(0.0, now - self._frame_change_t)
+        return frame
+
+    def _clear_camera(self):
+        """One owner for "the camera contributed nothing this pass"."""
+        self._cam_hit = None
+        self._cam_label = None
+        self._cam_conf = None
+        self._cam_raw_hits = 0
+        self._cam_persons = 0
+        self._detections = []
+
+    @staticmethod
+    def _normalise(hits, frame):
+        """Every detection this pass, as fractions of the frame: the viewer scales
+        the picture, and a second YOLO pass just for it would double the Pi's load.
+        """
+        height, width = frame.shape[:2]
+        if not width or not height:
+            return []
+
+        def frac(v, span):
+            return round(min(1.0, max(0.0, float(v) / span)), 4)
+
+        out = []
+        for h in hits:
+            x1, y1, x2, y2 = h.get("box", (0, 0, 0, 0))
+            name = str(h.get("name", "object"))
+            out.append({
+                "name": name,
+                "conf": round(float(h.get("conf", 0.0)), 3),
+                "person": name.lower() in PERSON_LABELS,
+                "box": [frac(x1, width), frac(y1, height),
+                        frac(x2, width), frac(y2, height)],
+            })
+        return out
+
     def camera_hit(self, now):
         """Most prominent camera detection, throttled to ``cam_hz``.
 
         Reuses the frame the camera thread already captured; it must not open the
         camera, or it would contend with cv_ctrl for the device.
         """
+        frame = self._sample_frame(now)      # measured even while throttled
         if self.cam_hz <= 0:
-            self._cam_hit = None
-            self._cam_label = None
-            self._cam_raw_hits = 0
-            self._cam_persons = 0
+            self._clear_camera()
             return None
         if now - self._last_cam_t < 1.0 / self.cam_hz:
             return self._cam_hit
         self._last_cam_t = now
 
-        frame = getattr(self.cvf, "_latest_raw_frame", None)
         if frame is None:
-            self._cam_hit = None
-            self._cam_label = None
-            self._cam_raw_hits = 0
-            self._cam_persons = 0
+            self._clear_camera()
+            return None
+        if self._frame_stale:
+            self._clear_camera()
             return None
         try:
             hits = self._detect(frame)
         except Exception as e:                                   # noqa: BLE001
             self._errors += 1
             print(f"[eyes] camera detection failed: {e}")
-            self._cam_hit = None
-            self._cam_label = None
-            self._cam_persons = 0
+            self._clear_camera()
+            return None
+
+        if not hits:
+            # Clear the lot, confidence included.  Nulling only the hit and the
+            # label here left the previous pass's confidence behind, so the
+            # status published `camera: null` next to `camera_conf: 0.91`.
+            self._clear_camera()
             return None
 
         self._cam_raw_hits = len(hits)
         self._cam_persons = sum(1 for h in hits
                                 if str(h.get("name", "")).lower() in PERSON_LABELS)
-        if not hits:
-            self._cam_hit = None
-            self._cam_label = None
-            return None
+        self._detections = self._normalise(hits, frame)
 
         height, width = frame.shape[:2]
         # People first.  The largest box in a room is often furniture, and the
@@ -331,6 +444,11 @@ class EyeGazer:
             "py": int(round(min(100.0, max(0.0, cy * 100.0 / height)))),
         }
         self._cam_label = hit["name"]
+        # The confidence of the box the eyes actually took.  A viewer cannot
+        # recover this from `detections` + the label: with two people in frame
+        # the strongest box is regularly not the one being followed, and
+        # reporting the other one's confidence contradicts the gaze.
+        self._cam_conf = hit["conf"]
         return self._cam_hit
 
     # ── serial link ──────────────────────────────────────────────────────────
@@ -428,6 +546,7 @@ class EyeGazer:
                 self._errors += 1
                 print(f"[eyes] gaze step failed: {e}")
             time.sleep(max(0.0, 1.0 / self.hz - (self._clock() - t0)))
+        self._park()
 
     def start(self):
         # Set the flag FIRST.  A loop that was mid-step when stop() ran is still
@@ -461,10 +580,26 @@ class EyeGazer:
             except Exception:                                    # noqa: BLE001
                 pass
         self._drop_link()
+        self._park()
+
+    def _park(self):
+        """Publish nothing: no target, no shape, no camera, no frame age.
+
+        One owner for "the gaze is not running", called by stop() so the state
+        goes at once and by the loop as it exits - a step that was inside the
+        first model load when stop() stopped waiting would otherwise publish
+        boxes, a confidence and a frame age that nothing is refreshing.  Parking
+        is refused while the gaze is running, because a loop that is still
+        exiting may find a restart already publishing a live decision.
+        """
+        if self._enabled:
+            return
         self._hold_px = None
         self._hold_py = None
         self._reason = "stopped"
         self._target = None
+        self._clear_camera()
+        self._forget_frame()
 
     def status(self, now=None):
         now = self._clock() if now is None else now
@@ -482,8 +617,20 @@ class EyeGazer:
             "lidar_mm": None if lidar is None else round(lidar[0], 1),
             "lidar_bearing_deg": None if lidar is None else round(lidar[1], 1),
             "camera": self._cam_label,
+            "camera_conf": self._cam_conf,
             "camera_hits": self._cam_raw_hits,
             "camera_persons": self._cam_persons,
+            # What the camera sees, for a viewer that wants to draw it.  The
+            # chosen gaze only ever names one box; this is all of them.
+            "detections": list(self._detections),
+            "frame_age_s": None if self._frame_age_s is None
+                           else round(self._frame_age_s, 2),
+            "frame_stale": self._frame_stale,
+            # False with an error set means no person can ever be seen: the
+            # model did not load.  That single line is the difference between
+            # "it sees nobody" and "it cannot see".
+            "model_ready": self._model is not None,
+            "model_error": self._model_error,
             "prox_mm": self.prox_mm,
             "close_mm": self.close_mm,
             "hz": self.hz,
