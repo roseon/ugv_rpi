@@ -25,6 +25,7 @@ public sealed class RobotClient : IAsyncDisposable
         // with a loop per click.
         _cts.Cancel();
         _cts = new CancellationTokenSource();
+        State.Eyes = EyesStatus.NotPolled();   // never draw the previous robot's boxes
         State.ConnDetail = $"connecting to {State.HostLabel} ...";
         Ctrl?.DisposeAsync().AsTask().Wait(200);
         Json?.DisposeAsync().AsTask().Wait(200);
@@ -51,6 +52,7 @@ public sealed class RobotClient : IAsyncDisposable
 
     public event Action<BitmapSource>? VideoFrame;
     public event Action? CamerasChanged;
+    public event Action? EyesChanged;
     public event Action<double, double>? CommandSent;
 
     public BitmapSource? LastFrame { get; private set; }
@@ -74,6 +76,29 @@ public sealed class RobotClient : IAsyncDisposable
         await using var s = await resp.Content.ReadAsStreamAsync(_cts.Token);
         using var doc = await JsonDocument.ParseAsync(s, cancellationToken: _cts.Token);
         return doc.RootElement.Clone();
+    }
+
+    /// <summary>
+    /// Poll the gaze state. This is the one place that can say why the eyes are
+    /// not following anyone: whether a camera frame is reaching the gaze, whether
+    /// a model loaded, what was detected, and whether the Uno link is up.
+    /// </summary>
+    public async Task PollEyesAsync(CancellationToken ct)
+    {
+        try
+        {
+            var j = await GetJsonAsync("/eyes_status");
+            State.Eyes = EyesStatus.Parse(j);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+        catch (HttpRequestException h) when (h.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            // The Pi is up and answering, but has no gaze endpoint at all: the
+            // build running there predates the eyes.
+            State.Eyes = EyesStatus.NotDeployed();
+        }
+        catch (Exception ex) { State.Eyes = EyesStatus.Unavailable(DescribeUnreachable(ex)); }
+        EyesChanged?.Invoke();
     }
 
     public Task<JsonElement> RetryCameraAsync() => PostFormAsync("/retry_camera", new Dictionary<string, string>());
@@ -276,6 +301,13 @@ public sealed class RobotClient : IAsyncDisposable
     {
         var lidarTimer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
         var statusTimer = new PeriodicTimer(TimeSpan.FromSeconds(2));
+        var eyesTimer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
+
+        _ = Task.Run(async () =>
+        {
+            while (await eyesTimer.WaitForNextTickAsync(ct))
+                await PollEyesAsync(ct);
+        });
 
         _ = Task.Run(async () =>
         {

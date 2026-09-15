@@ -4,6 +4,7 @@
     <Grid>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
 
@@ -21,12 +22,33 @@
             </DockPanel>
         </Border>
 
-        <UniformGrid Columns="2" Grid.Row="1">
+        <!-- What the robot's own gaze sees.  Every way the eyes can fail to follow
+             a person looks identical from outside the robot, so all four links of
+             that chain are shown here and the broken one is named. -->
+        <Border Style="{StaticResource PanelCard}" Grid.Row="1">
+            <DockPanel>
+                <TextBlock Text="ROBOT VISION" Style="{StaticResource SectionTitle}" VerticalAlignment="Center"/>
+                <CheckBox x:Name="ShowBoxes" Content="Boxes" IsChecked="True" Foreground="White"
+                          VerticalAlignment="Center" Margin="10,0,0,0"
+                          Checked="OnShowBoxesChanged" Unchecked="OnShowBoxesChanged"/>
+                <StackPanel Margin="16,0,0,0" VerticalAlignment="Center">
+                    <TextBlock x:Name="VisionHealth" Text="" FontWeight="Bold" TextWrapping="Wrap"/>
+                    <TextBlock x:Name="VisionCam" Text="CV  —" Style="{StaticResource HudText}"/>
+                    <TextBlock x:Name="VisionGaze" Text="GAZE  —" Style="{StaticResource HudText}"/>
+                    <TextBlock x:Name="VisionLink" Text="EYES  —" Style="{StaticResource HudText}"/>
+                </StackPanel>
+            </DockPanel>
+        </Border>
+
+        <UniformGrid Columns="2" Grid.Row="2">
             <Border Style="{StaticResource PanelCard}">
                 <DockPanel>
-                    <TextBlock DockPanel.Dock="Top" Text="VIEW A — main stream" Style="{StaticResource SectionTitle}"/>
+                    <TextBlock DockPanel.Dock="Top" Text="VIEW A — main stream, robot detections drawn on it" Style="{StaticResource SectionTitle}"/>
                     <Border Background="Black" CornerRadius="6" ClipToBounds="True">
-                        <Image x:Name="ViewA"/>
+                        <Grid x:Name="ViewAHost">
+                            <Image x:Name="ViewA" Stretch="Uniform"/>
+                            <Canvas x:Name="ViewAOverlay" IsHitTestVisible="False"/>
+                        </Grid>
                     </Border>
                 </DockPanel>
             </Border>

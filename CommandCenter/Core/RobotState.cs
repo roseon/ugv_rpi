@@ -136,6 +136,12 @@ public class RobotState : System.ComponentModel.INotifyPropertyChanged
     int _selectedCam;
     public int SelectedCam { get => _selectedCam; set { _selectedCam = value; Raise(nameof(SelectedCam)); } }
 
+    // ── robot vision ──
+    // One owner for the last /eyes_status. The Cameras panel draws this and
+    // names the broken link from it, instead of polling the robot again.
+    EyesStatus _eyes = EyesStatus.NotPolled();
+    public EyesStatus Eyes { get => _eyes; set { _eyes = value; Raise(nameof(Eyes)); } }
+
     // ── learning ──
     public string LearnStatus = "idle";
     public void Note(string msg) => LearnStatus = msg;
