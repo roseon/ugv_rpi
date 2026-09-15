@@ -19,11 +19,11 @@ from gtts import gTTS
 import speech_recognition as sr  # Import the speech recognition library
 from threading import Thread
 from collections import deque
-import azure.cognitiveservices.speech as speechsdk
 import textwrap
 import logging
 from sklearn.linear_model import LinearRegression
-import pyttsx3
+import speech_face  # what the mouths are drawn from (Pi screen + desktop)
+import voice        # the robot's voice: every speech path goes through it
 from datetime import datetime  # Ensure this is imported correctly
 # Libraries for CSI camera
 from picamera2 import Picamera2
@@ -233,8 +233,6 @@ class OpencvFuncs():
     """docstring for OpencvFuncs"""
     def __init__(self, project_path, base_ctrl, lidar_port="/dev/ttyAMA0", baud_rate=115200, max_distance=0.5):
         # Any other initializations
-        self.speech_config = speechsdk.SpeechConfig(subscription="702d957143704526a6687ac6cde18194", region="eastus2")
-        self.speech_config.speech_synthesis_voice_name = "en-US-JennyNeural"  # Choose a voice you like
         #auto response systems
         self.wake_word = "hey lance"  # Wake word for activation
         self.wake_aliases = ("hey lance", "hi lucy", "hello lance", "hey lucy")
@@ -300,8 +298,6 @@ class OpencvFuncs():
         self.cv_motion_lock = False  # Initialize cv_motion_lock
         self.integral = 0.0
         self.lidar_distance = float('inf')
-        self.tts_engine = pyttsx3.init()
-        self.tts_engine.setProperty('volume', 10.0)  # Set volume to maximum (1.0 is the max)
         self.recognizer = sr.Recognizer()
         self.microphone = sr.Microphone()
         self.detected_people = 0
@@ -1475,15 +1471,17 @@ class OpencvFuncs():
         self.send_base_command({"T": 13, "X": 0, "Z": 0})  # Stop robot if low on battery
            
     def play_speech(self, text):
+        """Speak `text` — through the same Minion voice as everything else.
+
+        This used to be the pyttsx3 path, which meant the robot spoke in one voice
+        for Lance's replies and a different one for the UI's own lines.
+        """
         if self.speaking:
             print("Audio already playing; unable to start a new one.")
             return
         self.speaking = True
-        self.tts_engine.say(text)
         try:
-            self.tts_engine.runAndWait()
-        except RuntimeError:
-            print("Audio playback error.")
+            voice.speak(text)
         finally:
             self.speaking = False
 
@@ -1501,11 +1499,10 @@ class OpencvFuncs():
             self.robot_moving = False
             self.send_base_command({"T": 13, "X": 0, "Z": 0})
     
-            # Create a speech synthesizer
-            synthesizer = speechsdk.SpeechSynthesizer(speech_config=self.speech_config)
     
-            # Synthesize the greeting
-            synthesizer.speak_text_async("Hi, how can I be of service?").get()
+            # Announce through the robot's voice.  voice.speak is called directly
+            # because announce_person_detected already holds self.speaking.
+            voice.speak("Hi, how can I be of service?")
             self.last_announcement_time = time.time()
     
             # Start interaction after greeting
@@ -1530,70 +1527,20 @@ class OpencvFuncs():
                 logging.error(f"Error in listen_for_question: {e}")
                 self.speak_minion("Oops boss, something went wrong.")
 
-    MINION_PHRASES = ["Bello!", "Papoy!", "Bee-do-bee-do-bee-do!", "Ta-ta!", "Banana!", "Underwear!"]
-
-    def _synth_rest(self, ssml):
-        """Synthesize SSML via the Azure TTS REST endpoint (robust: the Speech SDK's
-        WebSocket layer fails to open on this box after a reboot, while plain HTTPS
-        works). Returns the WAV bytes."""
-        import urllib.request
-        url = f"https://{self.speech_config.region}.tts.speech.microsoft.com/cognitiveservices/v1"
-        req = urllib.request.Request(url, data=ssml.encode("utf-8"), method="POST")
-        req.add_header("Ocp-Apim-Subscription-Key", self.speech_config.subscription_key)
-        req.add_header("Content-Type", "application/ssml+xml")
-        req.add_header("X-Microsoft-OutputFormat", "riff-24khz-16bit-mono-pcm")
-        with urllib.request.urlopen(req, timeout=25) as r:
-            return r.read()
-
-    def _play_wav(self, wav_bytes):
-        """Play WAV bytes through the system default sink (currently the BT speaker)."""
-        import subprocess, tempfile, os
-        fd, path = tempfile.mkstemp(suffix=".wav", dir="/tmp")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(wav_bytes)
-            subprocess.run(["/usr/bin/paplay", path], timeout=40, check=False)
-        finally:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-
     def speak_minion(self, text):
-        """Speak `text` in a high-pitched fast 'minion' voice (Azure SSML), falling
-        back to the local pyttsx3 engine if synthesis fails."""
+        """Speak `text` in the robot's Minion voice (see voice.py).
+
+        This method is a guard, not an implementation: the robot has one voice and
+        one place that decides how it sounds, and every caller here goes through
+        it rather than owning its own SSML, its own credential and its own idea of
+        what to fall back to.
+        """
         if self.speaking:
             print("Audio already playing; skipping speech.")
             return
         self.speaking = True
         try:
-            phrase = random.choice(self.MINION_PHRASES)
-            ssml = (
-                '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">'
-                f'<voice name="en-US-JennyNeural"><prosody pitch="+40%" rate="+28%">'
-                f"{phrase} {text}"
-                '</prosody></voice></speak>'
-            )
-            # Primary: REST synthesis -> paplay (reliable; SDK WebSocket is broken on this box)
-            try:
-                wav = self._synth_rest(ssml)
-                if wav and wav[:4] == b"RIFF":
-                    self._play_wav(wav)
-                    return
-                logging.warning("REST TTS returned no audio; trying SDK")
-            except Exception as e:
-                logging.warning(f"REST TTS error: {e}; trying SDK")
-            # Fallback 1: Azure Speech SDK (plays to the default device itself)
-            try:
-                synthesizer = speechsdk.SpeechSynthesizer(speech_config=self.speech_config)
-                result = synthesizer.speak_ssml_async(ssml).get()
-                if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-                    return
-                logging.warning(f"Azure SDK TTS failed ({result.reason}); falling back to pyttsx3")
-            except Exception as e:
-                logging.warning(f"Azure SDK TTS error: {e}; falling back to pyttsx3")
-            # Fallback 2: local pyttsx3 engine
-            self.play_speech(text)
+            voice.speak(text)
         finally:
             self.speaking = False
 
@@ -1999,10 +1946,8 @@ class OpencvFuncs():
             logging.warning(f"Error sending command to base controller: {e}")    ### Environment Learning and Memory Buffer:
         # Greet user and handle interaction after wake word
     def respond_to_greeting(self):
-        synthesizer = speechsdk.SpeechSynthesizer(speech_config=self.speech_config)
-        
-        # Greet the user
-        synthesizer.speak_text_async("Hi, how can I be of service?").get()
+        # Greet in the robot's voice (this used to be the plain Azure default).
+        self.speak_minion("Hi, how can I be of service?")
         self.last_announcement_time = time.time()
 
         # Start interaction for a question

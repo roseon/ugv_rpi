@@ -4,7 +4,8 @@ import random
 import threading
 import time
 import yaml
-import pyttsx3
+
+import voice  # the robot's voice: one owner, so the UI's lines sound like Lance
 
 usb_connected = False
 
@@ -27,8 +28,8 @@ except:
 play_audio_event = threading.Event()
 min_time_bewteen_play = config['audio_config']['min_time_bewteen_play']
 
-engine = pyttsx3.init()
-engine.setProperty('rate', config['audio_config']['speed_rate'])
+# No local TTS engine here any more: speech is voice.py's, and this module keeps
+# the recorded sound effects (sounds/) it has always played.
 
 
 def play_audio(input_audio_file):
@@ -100,10 +101,14 @@ def set_min_time_between(input_time):
 
 
 def play_speech(input_text):
+	"""Say `input_text` in the robot's Minion voice (see voice.py).
+
+	This used to be pyttsx3 with the config's rate, so the web UI's own lines
+	("Lights activated") came out in a different voice from Lance's replies.
+	"""
 	if not usb_connected:
 		return
-	engine.say(input_text)
-	engine.runAndWait()
+	voice.speak(input_text)
 	play_audio_event.clear()
 
 
@@ -113,7 +118,7 @@ def play_speech_thread(input_text):
 	if play_audio_event.is_set():
 		return
 	play_audio_event.set()
-	speech_thread = threading.Thread(target=play_speech, args=(input_text,))
+	speech_thread = threading.Thread(target=play_speech, args=(input_text,), daemon=True)
 	speech_thread.start()
 
 def stop():

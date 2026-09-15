@@ -1,6 +1,7 @@
 # import base_ctrl library
 from base_ctrl import BaseController
 import serial_ports
+import speech_face  # the mouth's state: what the robot is saying, right now
 import threading
 import yaml, os
 
@@ -1102,6 +1103,38 @@ def api_lance():
     except Exception as e:
         logging.error("Lance API error: %s", e)
         return jsonify({'status': 'error', 'reply': f"Lance hit an error: {e}"}), 500
+
+
+@app.route('/speech_status', methods=['GET'])
+def speech_status():
+    """What both faces should be drawing now.
+
+    `speaking`, the words, and the last `window_s` of the mouth curve that
+    `speech_face.py` derived from the audio being played - measured from the WAV
+    itself, at display rate - so the panel and the desktop draw the syllables
+    instead of each guessing at a wobble of their own.
+    """
+    return jsonify(speech_face.FACE.snapshot())
+
+
+@app.route('/api/say', methods=['POST'])
+def api_say():
+    """Make the robot speak, for the Command Center's mouth panel.
+
+    Playback blocks for the length of the sentence, so it runs on its own thread
+    and the request returns at once; the panel follows /speech_status.
+    """
+    data = request.get_json(silent=True) or {}
+    # Every other POST here takes a form body, so a curl -d caller must not be
+    # told "nothing to say" for a sentence this app can read perfectly well.
+    text = (data.get('text') or request.form.get('text') or '').strip()
+    if not text:
+        return jsonify({'status': 'error', 'message': 'nothing to say'}), 400
+    if cvf.speaking:
+        return jsonify({'status': 'busy',
+                        'message': 'the robot is already speaking'}), 409
+    threading.Thread(target=cvf.speak_minion, args=(text,), daemon=True).start()
+    return jsonify({'status': 'success', 'text': text})
 
 
 @app.route('/lidar_status', methods=['GET'])
