@@ -240,3 +240,174 @@ AttributeError, logged `[lidar] open failed ...`, and only recovered via the
 reconnect that app.py's reader loop triggers. The open now happens at the end
 of `__init__`; the log shows `lidar serial connected succeed on /dev/ttyUSB0 @
 921600` on the first attempt with no failure line.
+
+## The mouth: the robot's speech has one owner, and a desktop face (Sep 15)
+
+| piece | owns |
+|---|---|
+| `speech_face.py` (`FACE`) | **the mouth's motion, once**: what is being said, when it started, the loudness measured from the very WAV bytes that go to `paplay`, and the model that turns that into the `(open, wide, smile)` curve both faces draw. Advanced lazily by whoever polls, at `SPS`, so the same syllable makes the same motion on the panel and on the desktop. |
+| `cv_ctrl.speak_minion` / `play_speech` | brackets playback with `FACE.begin(text, wav)` / `FACE.end(seq)`, so the state follows the audio that actually plays, whether or not a speaker is attached. |
+| `app.py` `GET /speech_status`, `POST /api/say` | the wire: `speaking`, `text`, `source`, `sps`, `window_s`, `seq`, and the last 1.5 s of the curve as `open`/`wide`/`smile`. `/api/say` takes JSON **or** a form body and returns at once (playback runs on its own thread); it answers `409` while the robot is already speaking. |
+| `CommandCenter/Core/SpeechStatus.cs` | parses that payload and indexes into the curve against the local clock (`Mouth(now)`), so a late poll reads further back instead of jumping. One freshness rule (`Live`, using the robot's own `window_s`): past the window the mouth rests closed, because a dead robot's mouth must not stay open on its last frame. |
+| `CommandCenter/Panels/MouthView.cs` | the drawing only, from that one curve — and the one thing genuinely local: the pointer can drag the mouth open by hand. It used to hold a second copy of the jaw timings, breathing and width, character for character with the panel's. |
+| `CommandCenter/Panels/FaceBar.xaml(.cs)` | the strip on every tab: live mouth, the speaking/idle line, a say box, and the *open it when it talks* checkbox. Also the reason the mouth is not moving (no robot / no `/speech_status` / the robot's refusal / idle).
+| `CommandCenter/FaceWindow.xaml(.cs)` | the big face, topmost and unowned (an owned window vanishes when the Command Center is minimised — exactly when a face is wanted). Opens itself on speech, remembers where you put it, and shows explicitly with `WindowState.Normal` because a window first shown while the app is minimised comes up minimised.
+
+The retired **Mouth tab** is gone: its content is the bar, so the face is visible on every tab rather than only while you are looking at it. Measured live on the big face (window captured by `PrintWindow`, mouth measured in pixels): idle opening 6–9 px, speaking up to 77 px with per-syllable variation, rank correlation against the robot's own level **+0.75 at a 100 ms lag**; a real mouse drag held it at 77 px and it eased back to 9 px within 0.7 s after release.
+
+### One owner of gaze smoothing
+Two easing stages used to be stacked — `EyeGazer` walking the aim toward each
+detection, and the Uno easing again with `GAZE_SPEED`. The firmware now draws
+what it is sent (`GAZE_SPEED 1.0`); the only filter is `eyes_gaze.py`, with its
+time constant **bounded by the detector interval** (`min(0.15 s, interval/3)`),
+not chosen. `GAZE_STEP_MAX 5.5` stays, because a frame's cost is proportional to
+the distance it paints (measured 189 scattered fills = 54 ms on the bit-banged
+left panel), so a long move is spread over several cheap frames rather than
+being a second filter. Measured on the Uno with `GAZE?` (drawn pupil vs the aim
+it had been sent) while the aim ramped at a head's speed, flashing the same
+sketch with and without the firmware's ease — **4.2 aim units (5.9 px) with it,
+3.1 (4.3 px) without**,
+which is one frame of travel. A head-sized step is unchanged either way (25 aim
+units, 2.32 s vs 2.15 s to come within 1 unit), because the frame cap governs it.
+
+### What the mouth's structure is now, after the deletions
+
+One definition of the motion, two renderers:
+
+```
+speech_face.Speech (on the robot)   the model: level -> (open, wide, smile), at SPS,
+   |                                plus `window_s` so nobody re-derives the window
+   v
+/speech_status                      the last 1.5 s of that curve, timestamped on arrival
+   |
+   +--> face_screen.py  (panel)     indexes the curve with time.monotonic
+   +--> SpeechStatus.cs (desktop)   indexes it with DateTime.UtcNow
+```
+
+Both sides index the *same* way - newest frame at the payload's arrival time, and a
+frame further back the longer ago that was - and both rest closed once the payload is
+older than `window_s`, so a dead robot's mouth cannot stay open on its last frame.
+The clock is UTC on both sides of the subtraction; a status stamped in UTC read
+against a local `now` is four hours in the future, which pinned the desktop to the
+newest frame of each poll and threw the rest of the curve away (measured: the drawn
+peak went from 30 px to 79 px once both ends agreed).
+
+Deleted this pass, having been added by earlier proving passes and reached by nothing:
+`POST /voice` with four presets and a runtime `voice.json` (the voice is a definition,
+not a choice), `Mouth.Speaking`/`Mouth.Level`, the desktop's own jaw timings and
+envelope interpolation (`LevelAt`, `ElapsedS`, `DurationS`), and the `1.5` re-derived
+in two renderers. The `TYPE 4` hardware-SPI firmware path, `start_face.sh`'s boot
+installer and the single `voice.py` owner stay: each is something a later request
+depends on.
+
+## The Minion face: eyes and mouth from the reference art (Sep 15)
+
+The eyes and the mouth are styled from the Minion goggle/mouth reference the user
+supplied. What that changed, and what it cost:
+
+| piece | now draws |
+|---|---|
+| `eyes_tft.ino` scene | one lens per panel: black strap knuckle at each side, then the goggle ring `r=114` (metal `#B9BEC2`, `#8A9095` outline), the yellow eyelid ring `r=105` (`#F5C842`), the white sclera `r=95`, and the brown iris `r=32` (`#9B4A24`) with a `r=16` pupil and a `r=6` white highlight up-left. RGB565 values were computed, not eyeballed (`0xBDF8`, `0x8C92`, `0xF648`, `0x9A44`). |
+| `eyes_tft.ino` gaze | the iris travel limit is now `sclera - iris - 2 = 61 px` instead of 69, because the goggle's two bands shrank the white the iris is allowed on. A per-axis clamp would push it onto the yellow at diagonal gazes, so it stays the unit-vector rule. |
+| `face_screen.py` + `MouthView.cs` | the mouth: yellow lips (`#F7CE4A` top, `#E3AA2E` lower, `#C98B1E` edge), maroon interior (`#6E1B2A`, `#450E19`), a row of 7 separate white teeth with 1 px gaps hanging from the top edge, a second row of 5 only when the jaw is well open, and a red tongue (`#E06B6B`, `#B84F4E`). Same names, same values, same numbers in both files. |
+
+Measured, since an Uno with no panel attached cannot be photographed:
+
+- **The firmware's drawing is replicated and asserted** (`goggle sim`, run before
+  deleting it): on the glass — metal ring 5,992 px, yellow eyelid 6,276 px, white
+  sclera 25,136 px, iris 2,412 px, pupil 684 px, highlight 113 px, strap 4,154 px —
+  and at the travel limit in all eight directions the furthest iris pixel is
+  `+0.0 px` beyond the sclera edge, i.e. it never rides onto the yellow.
+- **The panel mouth, live** (grim, centre column classified by colour): idle
+  opening 7 px of maroon inside the yellow lips — the reference's closed smile —
+  and 103 px at a syllable's peak, with the lip band thinning 334 px → 255 px and
+  teeth appearing (5 px → 29 px at the centre column) as it opens.
+- **The desktop mouth, live** (face window captured with its chrome cropped):
+  yellow lip ~71,000 px, teeth grow 7,945 → 12,703 px while speaking, maroon
+  interior 800 → 10,791 px, opening 3..97 px across 13 distinct values.
+
+**The Uno is now at 87% of flash (28,082 bytes, 1,232 bytes of RAM free)**, down
+from 99% (32,162 bytes, **94 bytes free**). The `ST7735` and `ILI9341` paths that
+`avr-nm` had measured at 498 + 486 bytes of linked driver code — for panels this
+robot does not have — are deleted, along with the `TAB` command that existed only
+to probe them. The reclaimed build was then **flashed through the Pi's own
+toolchain and proved on the device**, not in the link map alone:
+
+| evidence | what it showed |
+|---|---|
+| `avrdude` | `Writing 28082 bytes to flash ... 100% 4.73s ... Avrdude done.` (the write, not just a compile) |
+| boot banner | `EYES FW v5.3 - Minion goggle (GC9A01A)`, `EYE1/EYE2 init ... r=114 lid=105 sclera=95 iris=32`, `EYES READY` — v5.3 exists only in this sketch; `HEAD` has no such banner at all |
+| command surface | `PING`→`PONG`; `TYPE 3 3`→`TYPE OK: LEFT=GC9A01A (bit-bang) RIGHT=GC9A01A (bit-bang)`; `GAZE?`→`GAZE aim 15.0 15.0  drawn -42.7 -42.7` |
+| travel clamp | the drawn offset at `T 15 15` is `61 × (15−50)/50 = −42.7` — the **sclera-derived** radius (95−32−2), not the 69 the panel radius gave before the goggle, so the new art's geometry is running |
+| repaint telemetry | `REPAINT n=25 avg=112..187ms fills≈335 px≈2600` — the iris is really being redrawn |
+| live gaze | 60/60 and 59/59 polls with a head box, `sent` 41→69, `errors` 0, `port /dev/ttyACM0`, vertical residual ≤0.4 units |
+| upload with the app running | `Error: protocol expects sync byte 0x14 but got 0x00` / `programmer is out of sync` / `unable to write flash`, exit 1 — the app owns the Uno, so it must be stopped first. Now written into the guide (§5), because the guide previously said only "upload" |
+
+The goggle is on the glass. What no remote check can show is the picture itself:
+the panels have no readback on this wiring (their MISO is unconnected by design),
+so "what the eye looks like" is proved by the firmware's own geometry banner and
+the drawn-offset values, not by pixels.
+
+**One measurement this pass did not change, because it would change behaviour the
+user did not ask about:** the gaze's two axes are mapped by *different rules*.
+`eyes_gaze.py` sends x through `box_bearing_deg()` — a 60° horizontal FOV spread
+over 120° of screen (`DEFAULT_SCREEN_FOV_DEG`), so a head box sweeping 0.14 of the
+frame *width* moves the aim ~7 units — while y is the raw frame fraction
+(`py = cy * 100 / height`), so the same 0.14 of the frame *height* moves the aim
+14 units. Measured on the live robot with a person standing still: |dx| mean 7.5,
+|dy| mean 0.2. The vertical axis therefore travels about **twice** the horizontal
+one for the same camera displacement. Either x or y is wrong: if the eyes' real
+cone is the same in both axes, the vertical mapping needs the camera's vertical
+FOV instead of the raw pixel fraction.
+
+### The voice has one owner, and the robot's own screen has a face (Sep 15, later)
+
+Every speech path used to synthesise for itself — Lance's replies through one
+Azure voice, the UI's own lines ("Lights activated") through pyttsx3 — so the
+robot spoke in two voices. There is one owner now:
+
+| piece | owns |
+|---|---|
+| `voice.py` | the voice: the Azure credential, the SSML (Minion pitch and rate plus a leading interjection), synthesis over REST (the SDK's WebSocket fails after a reboot while HTTPS works), `paplay`, the local fallback, and the robot-wide lock that stops two sentences talking over each other. A definition, not a choice: there were four presets with a `POST /voice` picker that no UI could reach and nobody asked for, so that surface is gone. |
+| `face_screen.py` | the face on the robot's **own 800×480 panel**: it polls `/speech_status` a few times a second and indexes the same curve at 60 fps, so the app does no drawing and the two faces cannot drift. It is a second process (it owns a display), so it is not a module `app.py` imports. |
+| `start_face.sh` | the whole lifecycle — `bash start_face.sh`, `--stop`, `--status`, `--selftest`. No caller may spell `face_screen.py` in the same shell as a `--stop`: the module's name in that shell's own command line makes `pkill -f` kill the shell, which looks exactly like a dead robot (no output, exit 255). Measured twice. |
+| `deploy.sh` `EXTRA` | the two files above ship even though nothing imports them; the module set stays derived from `app.py`'s imports, and a file with no importer has to be named explicitly. The far-side `py_compile` is fed only the `.py` files — passing it the bash launcher printed a SyntaxError and, with no `set -e` remotely, still exited 0. |
+
+Measured on the panel (captured with **grim** — this session is labwc, so the X
+root that `scrot` grabs is black while the composited output is not): idle
+opening **16–18 px**, speaking **10 → 143 px across 63 distinct openings**, and
+correlation against the robot's own published level **+0.89**; the widest frame
+drew 143 px where the model predicts 136. The caption appears only while
+speaking (0 → 1,405 caption pixels), so the panel shows the words as well. The
+app's own command line reaches the same voice: `POST /send_command` with
+`command=audio -s Lights activated` produces the envelope text
+**"Bee-do-bee-do-bee-do! Lights activated"**, measured from real audio (186
+frames).
+
+Boot: the `@reboot` entry is **installed from the repo**, not hand-written.
+`bash deploy.sh` ships `start_face.sh` and then asks it to `--install-boot`, so a
+replaced Pi gets its face back on the next deploy. The launcher owns that line
+(marked by a comment above it), which is what keeps the crontab and the script
+from drifting:
+
+| command | does |
+|---|---|
+| `--install-boot` | adds or repairs its own line, idempotently: a second run changes nothing, a duplicate or a hand-edited line collapses back to one canonical entry, and every line it does not own (the app, jupyter, ollama, the bluetooth sink) is left byte-for-byte alone. Backs the crontab up to `~/crontab_backup_<date>.txt` before writing and restores it if the install fails. Refuses to install if `face_screen.py` is not next to it, because a boot entry that cannot work is worse than none. |
+| `--reload` | restarts the face **only if it is already running**, so shipping new bytes updates the screen and a face someone stopped on purpose stays stopped. `deploy.sh` calls it; nothing watches the face, so a deliberate `--stop` is not undone. |
+| `--status` | running or not, and how many boot lines the crontab holds. |
+
+The wait is for the session, not for the socket file: a display whose socket
+exists with nothing listening **refuses the connection** (measured), so the
+launcher connects to `/tmp/.X11-unix/X<n>` before starting and retries up to six
+times with 10 s between, re-checking the display each time. Its first log line
+names the driver it got (`face_screen: x11 driver on display :0, 800x480`) —
+measured on this robot, `DISPLAY=:0` gives x11 while an SSH-launched run with
+`XDG_RUNTIME_DIR` set gives wayland, and both are the same panel.
+
+**No caller may write `face_screen.py` in the same shell as a `start_face.sh`
+stop/reload.** That shell's own command line then contains the name the
+`pkill -f` pattern matches, and the shell kills itself: no output, exit 255,
+which looks exactly like a dead robot. Hit three times while building this —
+including in `deploy.sh`, whose `[ -f face_screen.py ]` test made every deploy
+print both "reloaded" and "could not reach the robot". The deploy now names only
+the launcher.

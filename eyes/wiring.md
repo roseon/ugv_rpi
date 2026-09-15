@@ -10,7 +10,7 @@ This guide wires **two SPI TFT displays** (one per "eye") to an **Arduino Uno**,
 
 | Part | Notes |
 |---|---|
-| 2× SPI TFT display | Most common: **ST7735 1.8″** (128×160) or **ILI9341 2.4″/2.8″** (240×320). Any SPI TFT (ST7789, ILI9488, SSD1331…) works — same wiring, different Arduino library init. |
+| 2× SPI TFT display | **The sketch in this repo drives GC9A01A round 240×240 panels only** — the ST7735 and ILI9341 drivers were deleted to reclaim flash (§5). An **ST7735 1.8″** (128×160) or **ILI9341 2.4″/2.8″** (240×320) board wires up the same way, but its Adafruit driver has to be restored in the sketch first, so a garbage or blank panel on one of those is expected and not a wiring fault. |
 | 1× Arduino Uno | The Uno's ATmega16U2/CH340 gives the Pi a serial port over USB. |
 | 1× Raspberry Pi 5 | Runs the robot app, which owns the eyes' serial link and drives the gaze from LIDAR + camera. |
 | 8× male–female jumper wires | For display → Uno signal wires. |
@@ -46,7 +46,9 @@ The two displays are **fully independent** — **no signal wires are shared**. T
 
 Notes:
 - **No shared signal wires** — each display is on its own port, so you never have to tie SCK/MOSI together.
-- The left eye runs the firmware's **fast direct-port bit-bang SPI** (mosi=D3, sclk=D4) — a full 240×240 fill takes ~0.4 s instead of ~10 s with the Adafruit software-SPI path, so the eyes track gaze smoothly. The right eye uses hardware SPI (SCK=D13, MOSI=D11).
+- The left eye runs the firmware's **fast direct-port bit-bang SPI** (mosi=D3, sclk=D4) — a full 240×240 fill takes ~1.08 s on the left against ~0.225 s on the right (~9.4 µs/byte vs ~2 µs/byte, measured at boot: `FILL L: 1079ms R: 225ms`). The right eye uses hardware SPI (SCK=D13, MOSI=D11).
+- **What that costs the moving gaze, measured.** A tracking frame repaints only the pixels the iris move changes — ~345 spans, ~1210 px — and takes **~102 ms** end to end (~10 frames/s): ~46 ms of panel writes (the bit-banged left eye is most of it) plus ~52 ms of computing the row-by-row difference on the Uno. Before the incremental repaint, each frame erased and redrew both full irises (~12,900 px) and took **~341 ms** (2.9 frames/s), which is what the eyes were reported as "refreshing". The firmware prints `REPAINT n=25 avg=…ms fills=… px=…` so you can see that on the serial line.
+- **If you want the gaze genuinely smooth (25–30 frames/s), put the left panel on the same SPI bus as the right one**: `SDA/MOSI → D11`, `SCL/SCK → D13`, keep its own `CS`/`DC`/`RST`, then `echo 'TYPE 4 3' > /dev/ttyACM0` (no re-flash). The two panels share the bus and take turns by `CS`; the left eye then paints at the right eye's byte rate, which removes ~24 ms from every frame. It also **frees `D3` and `D4`** — and `D3` is a PWM pin (see the L298P note below).
 - `MISO` (D12) is **not connected** — the TFTs don't need it for writing.
 - **VCC → 3.3 V** is the safe rule for GC9A01A round modules (they have no onboard regulator — 5 V on VCC destroys them). If your board has an **onboard 3.3 V regulator** (common on ILI9341 2.4″ boards, identifiable by the small regulator + jumper near the header), you may feed `VCC` from the Uno's **5 V** instead — check the board's datasheet/silkscreen first.
 - **Power budget — a precaution against display corruption, *not* the diagnosis for a vanished Uno.** The Uno's `3.3V` pin is fed by an on-board LP2985 regulator rated **~50 mA recommended / 150 mA absolute maximum**. A 1.28″ GC9A01A round module draws **~10–20 mA** for logic *and* **~20–40 mA** for the backlight at full brightness, so **two of them on the Uno's 3.3 V pin can exceed that budget** and can brown out a *display*: white screen, random lines, or one eye dying while the other keeps working. Worth fixing on its own merits — give the displays their own **3.3 V supply** (VCC and LED both), tie its GND to the Uno's GND, and leave the Uno's 3.3 V pin for logic only. **It does not explain the Uno disappearing from USB**, for the reasons measured in §3a.
@@ -55,7 +57,8 @@ Notes:
   - **As a separate module jumpered to the same pins**, the shield's control pins are high-impedance inputs, so panel signals still arrive, but the motors twitch with every display transaction, and any variant that buffers or inverts those lines corrupts the display data outright.
   - **If both must live on one Uno — what is actually free.** `D2` and `D12` as digital I/O (*`D12` only if you do not wire the optional auto-detect `MISO`*), and `A0`–`A5` (= digital `14`–`19`) **as digital only: the analog pins cannot `analogWrite`**. `D0`/`D1` stay reserved for the Uno's USB-serial pair.
   - **There is no free PWM pin, so the analog header cannot give the module speed control.** The Uno's PWM-capable pins are `D3 D5 D6 D9 D10 D11` — six of them — and this build holds **all six**: `D3` is the LEFT eye's `MOSI`, `D5`/`D6` its `RST`/`DC`, `D9`/`D10` its `DC`/`CS`, and `D11` is the RIGHT eye's `MOSI`. An L298P's `EN` (speed) inputs need one of those, so moving the eyes to `A0`–`A5` does not create the speed pin the module wants.
-  - **Which eye signals need no PWM at all:** `CS`, `DC` and `RST`. The sketch drives all three with plain `digitalWrite` and takes them as constants (`L_CS`, `L_DC`, `L_RST`, `R_CS`, `R_DC`, `R_RST`), so moving one to `A0`–`A5` is a one-line change to that constant. **Leave the left eye's `MOSI`/`SCLK` on `D3`/`D4`** — the firmware bit-bangs those two through direct PORTD writes, so moving them costs the fast fill path and needs a firmware change, not just a constant.
+  - **Which eye signals need no PWM at all:** `CS`, `DC` and `RST`. The sketch drives all three with plain `digitalWrite` and takes them as constants (`L_CS`, `L_DC`, `L_RST`, `R_CS`, `R_DC`, `R_RST`), so moving one to `A0`–`A5` is a one-line change to that constant.
+  - **The one move that both frees a PWM pin and speeds the eyes up:** put the left panel's two data wires on the SPI bus — `MOSI D3 → D11`, `SCLK D4 → D13`, keeping its own `CS`/`DC`/`RST` — and set `TYPE 4 3`. That returns **`D3` (PWM-capable) and `D4`** to the free list, so the L298P's `EN` can have `D3`, and the left eye stops being the slow half of every frame. This is the only eye-wire change worth making: the firmware supports both wirings (type 3 = bit-bang on D3/D4, type 4 = bus on D11/D13), so nothing needs re-flashing to switch.
   - **The honest options:** (1) drive the motors from the **ESP32 base controller** — the chassis motors are already that controller's job on this robot, so a second driver on the Uno buys nothing; (2) **accept full-speed-only direction control** — tie the L298P's `EN` pins `HIGH` and put `IN1`/`IN2` on `D2`/`D12` or on `A0`–`A5` (digital only), giving forward/reverse/stop and no speed adjustment; or (3) **free a PWM pin deliberately** by moving one eye's `CS`, `DC` or `RST` to the analog header and redefining it in the sketch, which frees that pin's PWM — e.g. `D10` or `D9` — for the module's `EN`. Prefer `D9`/`D10`: `D5`/`D6` are the only other movable PWM pins here, and they sit on **Timer 0**, which is where `millis()` comes from — the same clock this firmware times its fills and gaze loop with.
 - **A stacked shield can also back-power the Uno.** On the documented L298P shield the motor supply can be jumpered onto the Arduino's `Vin` (its `OPT` jumper), and with that jumper fitted but no motor supply connected it will try to run the motors from USB. If the displays' `VCC`/`LED` are also fed from the Uno's `3.3V` pin, that rail is a shared weak point. Keep the display supply separate.
 - Backlight: tie `LED` to **3.3 V** on both displays. **Do not move the left eye's `LED` to D3** — D3 is that eye's data line (MOSI), and a PWM backlight on it will fight the SPI data and kill the left eye. There is genuinely no spare PWM pin for the backlights on an Uno with this pin map — the eyes hold all six PWM-capable pins, and `D2` (the one free digital pin) cannot `analogWrite` either, so **no** Uno pin can dim a backlight here. If you need to dim, dim on the **supply side** (a series resistor, or a separate adjustable 3.3 V rail), not from the Uno.
@@ -138,9 +141,25 @@ The Uno's outputs are **5 V**; TFT controller chips (ST7735, ILI9341) are rated 
 
 ### Arduino Uno — `eyes_tft/eyes_tft.ino`
 1. Open `eyes_tft/eyes_tft.ino` in the Arduino IDE (it's in its own folder, as Arduino requires).
-2. Install libraries: **Adafruit GFX**, plus **Adafruit ST7735** (1.8″), **Adafruit ILI9341** (2.4″/2.8″) and **Adafruit GC9A01A** (round 1.28″ 240×240).
-3. Set `DEFAULT_TYPE` at the top to match your boards (`1`=ST7735, `2`=ILI9341, `3`=GC9A01A round — the default) and confirm the pin constants match §2.
-4. Upload. Each screen shows one big cartoon eye (sclera + colored iris + pupil).
+2. Install libraries: **Adafruit GFX** and **Adafruit GC9A01A** (round 1.28″ 240×240). The sketch no longer includes the ST7735/ILI9341 drivers, so installing them changes nothing.
+3. `DEFAULT_TYPE` is already `3` — GC9A01A on the bit-bang port (D3/D4). Its only other value is `4`, the same panel with its two data wires moved to the hardware SPI bus; `TYPE 4 3` over serial does the same without a re-flash. Confirm the pin constants match §2, and confirm what is actually on the board from the boot banner ("Boot behavior", below).
+4. **Upload — stop the app first.** The app owns `/dev/ttyACM0`, and an upload attempted while it runs dies in the bootloader handshake (`Error: protocol expects sync byte 0x14 but got 0x00`, `programmer is out of sync`, `unable to write flash`) and silently leaves the old firmware in place. Measured on the robot, the whole sequence is:
+
+   ```bash
+   ssh ws@<robot>
+   pkill -f '[a]pp\.py'; sleep 2          # the app has to release the Uno
+   ~/arduino-cli/arduino-cli compile --fqbn arduino:avr:uno ~/ugv_rpi/eyes/eyes_tft
+   ~/arduino-cli/arduino-cli upload  -p /dev/ttyACM0 --fqbn arduino:avr:uno ~/ugv_rpi/eyes/eyes_tft
+   #   Writing | ################################################## | 100% ... Avrdude done.
+   cd ~/ugv_rpi && nohup ./ugv-env/bin/python app.py >> app.log 2>&1 </dev/null &
+   ```
+
+   That build is **28,082 bytes (87%) of the Uno's 32,256**, with 1,232 bytes of RAM free — it was at 99% (94 bytes free) until the legacy panel drivers were deleted. Once it is flashed, each screen shows one big cartoon eye in the Minion goggle design: a
+grey metal ring around the panel edge, a yellow eyelid ring inside it, a large
+white sclera, and a small brown iris with a black pupil and a white highlight —
+plus the black strap knuckle entering at each side. The reference art this comes
+from is attached to the request that introduced it (Sept 2026); the proportions
+are the firmware's own: ring r=114, eyelid r=105, sclera r=95, iris r=32.
 
 ### Raspberry Pi 5 — the app owns the gaze
 `app.py` drives the eyes through `eyes_gaze.py`. It looks at whatever the LIDAR reports inside `prox_mm` (default **1200 mm**), takes over for anything inside `close_mm` (default **450 mm**) — the "something is getting too close" case — and otherwise **follows the people the camera sees**: a `person` detection is preferred over any other object, and only when no person is in frame does the largest object drive the gaze. It is the **only** writer of `T <px> <py>`; a second writer would interleave pupil positions, so nothing else may open the Uno while it runs.
@@ -183,7 +202,7 @@ python eyes/pi_eyes.py --list     # which node is which (touches no hardware)
 | `T <px> <py>` | Look toward point; `px`,`py` in **0–100** (50,50 = frame center). Both pupils converge on it. |
 | `T -1 -1` | No person in view — pupils return to center. |
 | `PING` | Uno replies `PONG` — wiring/link sanity check. |
-| `TYPE <l> <r>` | Set each eye's controller at runtime: `1` = ST7735, `2` = ILI9341, `3` = GC9A01A round (e.g. `TYPE 3 3`). Re-initializes both displays and re-runs the color test. No re-flash needed. |
+| `TYPE <l> <r>` | Set which port each eye is on at runtime: `3` = GC9A01A on the bit-bang port (as wired, e.g. `TYPE 3 3`), `4` = the same panel moved to the hardware SPI bus. Re-initializes both displays and re-runs the color test. No re-flash needed. Anything else prints the two valid values and changes nothing. |
 
 ### Boot behavior (this is your main diagnostic)
 When the Uno powers up (or resets) it prints the pin map and controller IDs over serial, then **paints LEFT eye RED and RIGHT eye GREEN for 4 seconds** — the color test — then switches to eye mode. What you see during those 4 seconds tells us exactly what's wrong:
@@ -192,7 +211,7 @@ When the Uno powers up (or resets) it prints the pin map and controller IDs over
 |---|---|---|
 | Left RED, right GREEN | Wiring + both inits correct | nothing — eyes follow |
 | One solid color, other blank/garbage | That eye's wiring or controller type is wrong | re-check that eye's 5 wires; try `TYPE` for that eye |
-| Neither shows color | Power problem (VCC/GND/LED/backlight) or wrong controller on both | check power first, then `TYPE 3 3` (GC9A01A) vs `TYPE 2 2` / `TYPE 1 1` |
+| Neither shows color | Power problem (VCC/GND/LED/backlight), or the panel is not the GC9A01A the sketch drives | check power first, then confirm the panel is a round 240×240 GC9A01A — nothing else has a driver in this sketch |
 | Scrolling lines/garbage | Controller mismatch (ST7735 init on ILI9341 panel or vice-versa), CS/DC swapped, or a display browned out (see the power budget in §2) | try the other `TYPE`; swap CS↔DC; then measure the display's `VCC`–`GND` |
 | The Uno **vanishes from the Pi** (`lsusb` lists it, no `/dev/ttyACM0`) | A **host-side** event on the Pi that left the port stuck unconfigured — measured, see §3a. The display load is *not* the cause | replug the Uno's USB (or reset the port) and re-check |
 
@@ -201,7 +220,7 @@ When the Uno powers up (or resets) it prints the pin map and controller IDs over
 ## 6. Bring-up test sequence (with the color test)
 
 1. Upload `eyes_tft/eyes_tft.ino`.
-2. Watch the screens during boot: **LEFT should flash RED, RIGHT should flash GREEN** for ~4 s, then both show one cartoon eye filling the round panel (white sclera circle edge-to-edge, colored iris + dark pupil + highlight).
+2. Watch the screens during boot: **LEFT should flash RED, RIGHT should flash GREEN** for ~4 s, then both show the goggle eye — grey ring at the panel edge, yellow eyelid inside it, white sclera, brown iris with a black pupil and a white highlight, black strap knuckle at each side. A board still running the old firmware shows a flat white circle with a blue iris and no yellow or grey at all, which is the quickest way to tell whether this sketch is actually flashed.
 3. If the colors are wrong/blank/garbage, use the table above, and switch controller types from the Pi **without re-flashing**:
    ```bash
    echo 'TYPE 3 3' > /dev/ttyACM0   # the eyes' Uno, see the node table in §3; or TYPE 1 1 / TYPE 2 2
@@ -218,12 +237,17 @@ When the Uno powers up (or resets) it prints the pin map and controller IDs over
 
 ## 7. The most common wiring mistake (read this if you used the old table)
 
-An earlier version of this guide shared one SPI bus (SCK→D13, MOSI→D11 for **both** displays). That is **wrong for the current firmware**. The left eye must be on **its own port**:
+An earlier version of this guide shared one SPI bus (SCK→D13, MOSI→D11 for **both** displays) without saying so, and the firmware's default for the left eye is the bit-bang driver:
 
-- LEFT eye: `SCL/SCK → D4`, `SDA/MOSI → D3`
-- RIGHT eye: `SCK → D13`, `SDA/MOSI → D11`
+- LEFT eye, default: `SCL/SCK → D4`, `SDA/MOSI → D3` — the firmware's `TYPE 3`
+- RIGHT eye, always: `SCK → D13`, `SDA/MOSI → D11`
 
-If you wired **both** displays' clock to D13 and data to D11, the left eye will be blank or show garbage — move its two wires from D13→D4 and D11→D3. Do **not** tie both displays' SCK or MOSI together.
+**Tying both displays to D13/D11 is now supported** — it is the faster wiring — but you must tell the firmware: `echo 'TYPE 4 3' > /dev/ttyACM0`, and the left eye needs its own `CS`/`DC`/`RST` as always. If you wire the left display to the bus and leave the firmware on `TYPE 3`, that eye stays blank or shows garbage. Which is which:
+
+| Left eye wired to | Set with | Left-eye frame cost |
+| --- | --- | --- |
+| `SCLK D4`, `MOSI D3` | `TYPE 3 3` (default) | ~9.4 µs/byte, the slow half |
+| `SCK D13`, `MOSI D11` (shared bus) | `TYPE 4 3` | ~2 µs/byte, same as the right eye |
 
 ## 8. How the eye movement works (data flow)
 
@@ -241,7 +265,7 @@ The eye firmware is in `eyes_tft/eyes_tft.ino`; the Pi side is `eyes_gaze.py`, d
 1. **Backlight** — is the white LED behind the screen on? If not, check the `LED` pin is powered (3.3 V) and its wire isn't swapped with another pin. A lit backlight with no image = init/wiring problem; a dark screen = power problem.
 2. **VCC + GND** — measure 3.3 V between `VCC` and `GND` at each display's header.
 3. **Color test** — reboot the Uno and note each screen's color during the 4 s test (RED = left, GREEN = right).
-4. **Controller type** — try `TYPE 1 1` then `TYPE 2 2` and repeat the color test; one of them should light up solid if the wiring is right.
+4. **Which port the left eye is on** — on the bit-bang port as wired (`TYPE 3 3`) unless its two data wires were moved to the SPI bus (`TYPE 4 3`). The wrong one of the two leaves the left eye blank or garbled and never touches the right eye, so it is the first thing to rule out.
 5. **Per-eye wiring** — left eye: D4(clock) D3(data) D10(CS) D9(DC) D8(RST). Right eye: D13(clock) D11(data) D7(CS) D6(DC) D5(RST). A blank eye usually means its CS/DC/RST wires are on the wrong Uno pins.
-5b. **Left eye blank/white while the right eye works** — the left eye is the only display driven by the firmware's own bit-bang driver, and before **v5.1** that driver never asserted chip-select while it sent the init sequence. A GC9A01A ignores every byte received with CS high, so `SLPOUT`/`COLMOD`/`DISPON` were all discarded, the panel stayed asleep, and the eye showed nothing however much pixel data followed. Fixed in **v5.1**. Confirm which firmware is actually on the board from the boot banner — the first serial line prints `EYES FW v5.1 …`; if it still says `v5`, the fix is not flashed yet. **Left blank *and* right dead together** points somewhere else entirely — something is holding `D10`, `D11` or `D13`; see the L298P note in §2.
-6. **Optional:** wire the right eye's MISO pin to **D12** — the firmware then auto-detects ST7735 vs ILI9341 and prints the panel ID at boot.
+5b. **Left eye blank/white while the right eye works** — the left eye is the only display driven by the firmware's own bit-bang driver, and before **v5.1** that driver never asserted chip-select while it sent the init sequence. A GC9A01A ignores every byte received with CS high, so `SLPOUT`/`COLMOD`/`DISPON` were all discarded, the panel stayed asleep, and the eye showed nothing however much pixel data followed. Fixed in **v5.1**. Confirm which firmware is actually on the board from the boot banner — the first serial line prints `EYES FW v5.3 - Minion goggle (GC9A01A)` for the current sketch, `v5.1` for the chip-select fix alone, and `v5` or `v5.2` for anything older; the per-eye `init:` line then prints `r=114 lid=105 sclera=95 iris=32`. If the banner is older than `v5.3`, this design is not flashed yet. **Left blank *and* right dead together** points somewhere else entirely — something is holding `D10`, `D11` or `D13`; see the L298P note in §2.
+6. **MISO/D12** — the header still allows for it, but nothing reads it: there is no panel-ID probe in the firmware, so adding that wire changes nothing.
