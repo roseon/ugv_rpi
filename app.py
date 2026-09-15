@@ -961,11 +961,21 @@ def toggle_lidar_avoidance():
 def toggle_eyes():
     """Enable or disable the eyes' gaze, and optionally retune the distances.
     Accepts enable=true/false plus optional prox_mm / close_mm / cam_hz, from
-    either the form body or the query string.  An empty value counts as absent,
-    and nothing is applied unless all of it is usable."""
+    the form body, the query string or a JSON body.  An empty value counts as
+    absent, and nothing is applied unless all of it is usable."""
+
+    body = request.get_json(silent=True)
+    body = body if isinstance(body, dict) else {}
 
     def param(name):
-        return request.form.get(name) or request.args.get(name) or None
+        # JSON has to be read explicitly: a client that POSTs
+        # {"enable": false} used to be answered with a 200 and the eyes left
+        # switched ON, because a missing argument means enable and the body was
+        # never consulted.  Same for a JSON prox_mm / close_mm / cam_hz retune.
+        value = request.form.get(name) or request.args.get(name)
+        if value is None:
+            value = body.get(name)
+        return None if value is None else value
 
     try:
         enable = eyes_gaze.parse_enable(param('enable'))

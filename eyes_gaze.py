@@ -49,6 +49,15 @@ DEFAULT_SCREEN_FOV_DEG = 120.0
 # door rather than the human being looked at.
 PERSON_LABELS = frozenset({"person", "people", "human"})
 
+# A person's box runs from head to feet, and aiming at its centre parks the
+# pupils on a chest.  Without a keypoint model the head is estimated as the
+# top-centre of that box: the top sixth of its height (chin level) and a third of
+# its width, centred - so the eyes look at the face as the person moves and as
+# they come closer.
+HEAD_HEIGHT_FRAC = 0.16
+HEAD_WIDTH_FRAC = 0.34
+
+
 # Nearest reading closer than this is treated as noise/self-return, not an object.
 MIN_OBSTACLE_MM = 60.0
 
@@ -60,6 +69,30 @@ FRAME_STALE_S = 2.0
 # Send the same command again this often, so a dropped line or a reset Uno
 # catches up without waiting for the gaze to change.
 SEND_REPEAT_S = 1.0
+
+# This class is the only smoothing in the gaze path: it walks the aim toward the
+# newest detection, and the firmware draws what it is sent.  Two filters in
+# series used to sit here - this walk plus the Uno's own easing - and measured on
+# the robot, with both in place, the drawn pupil trailed the aim it had been sent
+# by 5.9 px while tracking at a head's speed; with the Uno's easing removed the
+# same test leaves 4.3 px, which is one frame of travel - the most a ~9 frame/s
+# panel can do.  (A head-sized step costs the same either way: 25 aim units and
+# ~2.2 s, because the frame-affordability cap, not the easing, governs it.)
+#
+# How long the walk may take is bounded by the sampling rate, not chosen: the
+# detector reports at cam_hz, so closing the gap in a fixed time unrelated to it
+# either lags a slow detector or leaves a fast one stepping once per sample.  A
+# third of one interval is under the sampling floor and still smooth.
+AIM_EASE_S = 0.15               # never slower than this, whatever the detector
+AIM_EASE_OF_INTERVAL = 1.0 / 3.0
+
+
+def head_box(box):
+    """The estimated head region of a person box, in frame pixels."""
+    x1, y1, x2, y2 = box
+    centre = (x1 + x2) / 2.0
+    half = max(0.0, x2 - x1) * HEAD_WIDTH_FRAC / 2.0
+    return (centre - half, y1, centre + half, y1 + max(0.0, y2 - y1) * HEAD_HEIGHT_FRAC)
 
 
 def bearing_to_px(bearing_deg, screen_fov_deg=DEFAULT_SCREEN_FOV_DEG):
@@ -192,6 +225,9 @@ class EyeGazer:
         self._hold_px = None
         self._hold_py = None
         self._hold_t = 0.0
+        self._aim = None                  # the eased aim, walked toward each target
+        self._aim_sent = None             # the last point the Uno was told to draw
+        self._aim_t = 0.0
         self._last_cmd = None
         self._last_send_t = 0.0
 
@@ -367,13 +403,21 @@ class EyeGazer:
         for h in hits:
             x1, y1, x2, y2 = h.get("box", (0, 0, 0, 0))
             name = str(h.get("name", "object"))
-            out.append({
+            person = name.lower() in PERSON_LABELS
+            entry = {
                 "name": name,
                 "conf": round(float(h.get("conf", 0.0)), 3),
-                "person": name.lower() in PERSON_LABELS,
+                "person": person,
                 "box": [frac(x1, width), frac(y1, height),
                         frac(x2, width), frac(y2, height)],
-            })
+            }
+            if person:
+                # What the eyes are actually aimed at, so a viewer can show it
+                # instead of guessing from the whole-body box.
+                hx1, hy1, hx2, hy2 = head_box((x1, y1, x2, y2))
+                entry["head"] = [frac(hx1, width), frac(hy1, height),
+                                 frac(hx2, width), frac(hy2, height)]
+            out.append(entry)
         return out
 
     def camera_hit(self, now):
@@ -435,12 +479,14 @@ class EyeGazer:
             self._cam_persons = 0
             return None
 
-        _area, hit, (x1, y1, x2, y2) = best
-        cy = (y1 + y2) / 2.0
+        _area, hit, box = best
+        # A person is aimed at by the head, anything else by its own box.
+        aim = head_box(box) if str(hit.get("name", "")).lower() in PERSON_LABELS else box
+        cy = (aim[1] + aim[3]) / 2.0
         self._cam_hit = {
             "name": hit["name"],
             "conf": hit["conf"],
-            "bearing_deg": box_bearing_deg(best[2], frame_width=float(width)),
+            "bearing_deg": box_bearing_deg(aim, frame_width=float(width)),
             "py": int(round(min(100.0, max(0.0, cy * 100.0 / height)))),
         }
         self._cam_label = hit["name"]
@@ -530,12 +576,50 @@ class EyeGazer:
         self._target = None if px is None else (px, py)
         self._last_step_t = now
 
-        cmd = gaze_command(px, py)
+        aim = self._ease_aim(now, px, py)
+        cmd = gaze_command(None, None) if aim is None else gaze_command(*aim)
         if cmd != self._last_cmd or (now - self._last_send_t) >= SEND_REPEAT_S:
             if self._emit(cmd, now):
                 self._last_cmd = cmd
                 self._last_send_t = now
+                # What the Uno has actually been told.  Published so the gap
+                # between the head the camera found and the point the eyes were
+                # sent is readable from the surface rather than inferred.
+                self._aim_sent = aim
         return self.status(now)
+
+    def aim_tau(self):
+        """How long the aim may take to answer a new sample.
+
+        A third of a detector interval, capped: with cam_hz 0 the LIDAR is the
+        only target and it is read every loop tick, so the interval is the loop's.
+        """
+        interval = 1.0 / self.cam_hz if self.cam_hz > 0 else 1.0 / self.hz
+        return min(AIM_EASE_S, interval * AIM_EASE_OF_INTERVAL)
+
+    def _ease_aim(self, now, px, py):
+        """Walk the aim toward the target; return the integer point to send.
+
+        The first aim after nothing-to-look-at adopts the target outright, so the
+        eyes do not crawl across the screen from wherever they were.
+        """
+        if px is None:
+            self._aim, self._aim_t = None, now
+            return None
+        if self._aim is None:
+            self._aim, self._aim_t = (float(px), float(py)), now
+            return int(px), int(py)
+        dt = max(0.0, now - self._aim_t)
+        k = 1.0 - math.exp(-dt / self.aim_tau())
+        ax = self._aim[0] + (px - self._aim[0]) * k
+        ay = self._aim[1] + (py - self._aim[1]) * k
+        # Land exactly once close, so a settled gaze stops changing what it sends.
+        if abs(px - ax) < 0.6:
+            ax = float(px)
+        if abs(py - ay) < 0.6:
+            ay = float(py)
+        self._aim, self._aim_t = (ax, ay), now
+        return int(round(ax)), int(round(ay))
 
     def _loop(self):
         while self._enabled:
@@ -596,6 +680,8 @@ class EyeGazer:
             return
         self._hold_px = None
         self._hold_py = None
+        self._aim = None
+        self._aim_sent = None
         self._reason = "stopped"
         self._target = None
         self._clear_camera()
@@ -614,6 +700,8 @@ class EyeGazer:
             "reason": self._reason,
             "target": None if target is None
                       else {"px": target[0], "py": target[1]},
+            "aim": None if self._aim_sent is None
+                   else {"px": self._aim_sent[0], "py": self._aim_sent[1]},
             "lidar_mm": None if lidar is None else round(lidar[0], 1),
             "lidar_bearing_deg": None if lidar is None else round(lidar[1], 1),
             "camera": self._cam_label,

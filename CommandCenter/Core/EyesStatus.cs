@@ -13,8 +13,14 @@ namespace CommandCenter.Core;
 /// </summary>
 public sealed class EyesStatus
 {
+    /// <summary>A rectangle as fractions of the frame.</summary>
+    public record Box4(double X1, double Y1, double X2, double Y2);
+
+    /// <summary>One detection. <paramref name="Head"/> is present for people and
+    /// is where the eyes are aimed - the robot estimates the head from the
+    /// person box, and aiming at the box centre parks the pupils on a chest.</summary>
     public record DetBox(double X1, double Y1, double X2, double Y2,
-                         string Name, double Conf, bool Person);
+                         string Name, double Conf, bool Person, Box4? Head = null);
 
     /// <summary>False when the robot did not answer the endpoint at all.</summary>
     public bool Available { get; private set; }
@@ -82,6 +88,12 @@ public sealed class EyesStatus
         o.TryGetProperty(name, out var e) && e.ValueKind == JsonValueKind.String
             ? e.GetString() ?? "" : "";
 
+    static Box4? ReadBox4(JsonElement o, string name) =>
+        o.TryGetProperty(name, out var e) && e.ValueKind == JsonValueKind.Array
+        && e.GetArrayLength() >= 4
+            ? new Box4(e[0].GetDouble(), e[1].GetDouble(), e[2].GetDouble(), e[3].GetDouble())
+            : null;
+
     /// <summary>Parse one /eyes_status body. Never throws on a missing field: an
     /// older robot answers with fewer of them, and a missing one must read as
     /// "unknown", not as a hard failure.</summary>
@@ -120,7 +132,8 @@ public sealed class EyesStatus
                     b[0].GetDouble(), b[1].GetDouble(), b[2].GetDouble(), b[3].GetDouble(),
                     S(d, "name") is { Length: > 0 } n ? n : "object",
                     D(d, "conf") ?? 0,
-                    B(d, "person")));
+                    B(d, "person"),
+                    ReadBox4(d, "head")));
             }
         }
 

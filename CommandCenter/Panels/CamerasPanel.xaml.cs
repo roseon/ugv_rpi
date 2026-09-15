@@ -96,16 +96,29 @@ public partial class CamerasPanel : UserControl
         double dw = frame.PixelWidth * scale, dh = frame.PixelHeight * scale;
         double ox = (cw - dw) / 2, oy = (ch - dh) / 2;
 
+        void Place(EyesStatus.Box4 box, Brush stroke, double thickness)
+        {
+            var rect = new Rectangle
+            {
+                Width = (box.X2 - box.X1) * dw,
+                Height = (box.Y2 - box.Y1) * dh,
+                Stroke = stroke,
+                StrokeThickness = thickness,
+            };
+            Canvas.SetLeft(rect, ox + box.X1 * dw);
+            Canvas.SetTop(rect, oy + box.Y1 * dh);
+            ViewAOverlay.Children.Add(rect);
+        }
+
         foreach (var d in eyes.Detections)
         {
             double w = (d.X2 - d.X1) * dw, h = (d.Y2 - d.Y1) * dh;
             if (w < 2 || h < 2) continue;
             var ink = d.Person ? Ink : Warn;
 
-            var rect = new Rectangle { Width = w, Height = h, Stroke = ink, StrokeThickness = 2 };
-            Canvas.SetLeft(rect, ox + d.X1 * dw);
-            Canvas.SetTop(rect, oy + d.Y1 * dh);
-            ViewAOverlay.Children.Add(rect);
+            Place(new EyesStatus.Box4(d.X1, d.Y1, d.X2, d.Y2), ink, 2);
+            // For a person, the head is the part the eyes are aimed at.
+            if (d.Head is { } head) Place(head, ink, 1);
 
             var tag = new TextBlock
             {

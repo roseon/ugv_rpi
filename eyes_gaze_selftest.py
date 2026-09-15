@@ -11,8 +11,8 @@ Run: python eyes_gaze_selftest.py
 import math
 import types
 
-from eyes_gaze import (DEFAULT_SCREEN_FOV_DEG, EyeGazer, bearing_to_px,
-                       choose_gaze, gaze_command, nearest_obstacle,
+from eyes_gaze import (AIM_EASE_S, DEFAULT_SCREEN_FOV_DEG, EyeGazer, bearing_to_px,
+                       choose_gaze, gaze_command, head_box, nearest_obstacle,
                        parse_enable)
 
 CHECKS = 0
@@ -68,6 +68,11 @@ class FakeFrame:
 
     def __getitem__(self, _key):
         return _Pixels(0)
+
+
+def _aim_px(link):
+    """The px the last written command aimed at (the bytes the Uno receives)."""
+    return int(link.writes[-1].split()[1])
 
 
 class FakeLink:
@@ -556,6 +561,56 @@ check("a box outside the frame is clamped to 0..1",
                             "box": (-40, -40, 900, 700)}], FakeFrame(640, 480))[0]["box"]
       == [0.0, 0.0, 1.0, 1.0])
 
+# ── the eyes look at the head, not at the middle of the body ─────────────────
+# A person box runs head to feet, so aiming at its centre parks the pupils on a
+# chest.  The head is estimated as the top-centre of the box: the eyes then rise
+# with the face as the person moves and as they come closer.
+PERSON_BOX = (200.0, 100.0, 440.0, 460.0)         # 240 x 360 in a 640x480 frame
+hx1, hy1, hx2, hy2 = head_box(PERSON_BOX)
+check("the estimated head is the top of the person box",
+      hy1 == 100.0 and hy2 < (100.0 + 460.0) / 2.0,
+      f"got {head_box(PERSON_BOX)}")
+check("the head box stays inside the person box",
+      hx1 >= 200.0 and hx2 <= 440.0 and hy2 <= 460.0, f"got {head_box(PERSON_BOX)}")
+check("the head is narrower than the body", hx2 - hx1 < 440.0 - 200.0,
+      f"got {head_box(PERSON_BOX)}")
+
+
+def person_box_detector(box):
+    return lambda _f: [{"name": "person", "conf": 0.9, "box": box}]
+
+
+link = FakeLink()
+g = make_gazer(link, frame=FakeFrame(640, 480), detector=person_box_detector(PERSON_BOX),
+               cam_hz=2.0)
+st = g.step(now=1.0)
+check("a person is aimed at by the head, not by the middle of the body",
+      (st["target"] or {}).get("py") == 27, f"got {st['target']}")
+check("...while the horizontal aim still follows the person",
+      (st["target"] or {}).get("px") == 50, f"got {st['target']}")
+check("the bytes carry the head-level gaze", link.writes[-1] == b"T 50 27\n",
+      f"got {link.writes}")
+check("the published person carries the head the eyes used",
+      [round(v, 3) for v in st["detections"][0]["head"]] == [0.436, 0.208, 0.564, 0.328],
+      f"got {st['detections'][0].get('head')}")
+
+link = FakeLink()
+g = make_gazer(link, frame=FakeFrame(640, 480),
+               detector=person_box_detector((200.0, -100.0, 440.0, 300.0)), cam_hz=2.0)
+st = g.step(now=1.0)
+check("a head above the frame clamps to the top of the screen",
+      (st["target"] or {}).get("py") == 0, f"got {st['target']}")
+
+link = FakeLink()
+g = make_gazer(link, frame=FakeFrame(640, 480),
+               detector=lambda _f: [{"name": "chair", "conf": 0.9,
+                                     "box": (200.0, 100.0, 440.0, 460.0)}], cam_hz=2.0)
+st = g.step(now=1.0)
+check("a non-person is still aimed at by its whole box",
+      (st["target"] or {}).get("py") == 58, f"got {st['target']}")
+check("...and publishes no head", "head" not in st["detections"][0],
+      f"got {st['detections'][0]}")
+
 # A frame that stops changing is a dead capture loop.  Read as "empty camera"
 # it is wrong in both directions: the eyes point at a person who has walked away,
 # and nothing anywhere says the camera itself died.
@@ -716,6 +771,99 @@ try:
     check("status with detections is strict-JSON clean", True)
 except ValueError as e:
     check("status with detections is strict-JSON clean", False, f"invalid token {e!r}")
+
+# ── the aim the Uno is actually sent ──────────────────────────────────────────
+# The detector runs at 2 Hz while the loop runs at 10 Hz.  Forwarding a detection
+# unchanged makes the pupils jump once per camera frame and sit still in between,
+# which is the stepping the eyes were reported as doing; the aim is walked there
+# in the same number of steps a person would see as motion.
+link = FakeLink()
+g = make_gazer(link, scan=scan_for(0.0, 300.0), cam_hz=0.0)      # close, dead ahead
+st = g.step(now=1.0)
+check("the first aim adopts the target instead of crawling to it",
+      link.writes[-1] == b"T 50 50\n", f"got {link.writes}")
+check("...and the payload still reports the policy target",
+      st["target"] == {"px": 50, "py": 50} and st["reason"] == "lidar_close",
+      f"got {st['target']}")
+
+# the same obstacle swings to the left edge of the screen (px 0)
+g.base.rl.lidar_angles_show[:] = [math.radians(60.0 + 180.0)]
+g.step(now=1.05)                       # a third of the 0.15 s ease later
+mid = link.writes[-1]
+mid_px = int(mid.split()[1])
+check("a moving target is walked, not jumped",
+      0 < mid_px < 50, f"got {mid!r} for a 50 -> 0 move")
+check("...and the payload target is already the policy target, ahead of the aim",
+      g.status(1.05)["target"] == {"px": 0, "py": 50} and mid_px > 0,
+      f"got {g.status(1.05)['target']} with the aim at {mid_px}")
+
+for i in range(30):
+    g.step(now=1.15 + 0.1 * i)
+check("the aim lands exactly on a target that stops moving",
+      link.writes[-1] == b"T 0 50\n", f"got {link.writes[-1]}")
+g.step(now=60.0)
+check("a settled aim keeps sending the same point",
+      link.writes[-1] == b"T 0 50\n", f"got {link.writes[-1]}")
+
+# This walk is the whole of the smoothing - the firmware draws what it is sent -
+# so its time constant is what decides how far the pupils can be behind a head.
+# It is bounded by the sampling rate rather than picked: a fixed one unrelated to
+# cam_hz either lags a slow detector or leaves a fast one stepping per sample.
+for hz, want in ((2.0, AIM_EASE_S), (30.0, 1.0 / 90.0), (0.0, 1.0 / 30.0)):
+    g = make_gazer(FakeLink(), cam_hz=hz)
+    check(f"the aim's time constant at cam_hz {hz} is bounded by the sampling rate",
+          abs(g.aim_tau() - want) < 1e-9, f"got {g.aim_tau()} want {want}")
+
+# A head-sized step of the target, through the real camera path: walked there
+# rather than jumped to, within one detector interval, then landed exactly.
+seen_box = {"box": (40, 100, 160, 340)}          # px 33, the left of the frame
+link = FakeLink()
+g = make_gazer(link, frame=FakeFrame(640, 480), cam_hz=2.0,
+               detector=lambda _f: [{"name": "person", "conf": 0.9,
+                                     "box": seen_box["box"]}])
+g.step(now=1.0)
+check("a person on the left is aimed at", _aim_px(link) == 33, f"got {_aim_px(link)}")
+seen_box["box"] = (480, 100, 620, 460)            # the head steps to px 68
+st = g.step(now=1.5)
+stepped = _aim_px(link)
+check("a step is walked toward, not jumped to", 33 < stepped < 68, f"got {stepped}")
+# The status names both ends of the gap, so what the eyes were sent can be read
+# off the live robot instead of inferred: the aim trails the head it is chasing.
+check("the head is published where the camera found it",
+      st["target"] == {"px": 68, "py": 27}, f"got {st['target']}")
+check("the aim published is the point the eyes were actually sent",
+      st["aim"] == {"px": stepped, "py": 27}, f"got {st['aim']} vs sent {stepped}")
+check("...which is still behind the head on the step itself",
+      st["aim"]["px"] < st["target"]["px"], f"aim {st['aim']} target {st['target']}")
+for i in range(1, 6):
+    g.step(now=1.5 + 0.1 * i)
+within = _aim_px(link)
+check("...and is within 2 units of the new target one detector interval later",
+      abs(within - 68) <= 2, f"got {within} at +0.5 s")
+for i in range(6, 10):
+    st = g.step(now=1.5 + 0.1 * i)
+check("...and lands on it exactly", _aim_px(link) == 68, f"got {_aim_px(link)}")
+check("...at which point the aim and the head agree",
+      st["aim"] == st["target"], f"got {st['aim']} {st['target']}")
+for i in range(10, 20):                       # keep the same target for a while
+    g.step(now=1.5 + 0.1 * i)
+check("a settled gaze keeps aiming at the same point",
+      _aim_px(link) == 68, f"got {_aim_px(link)}")
+
+# nothing to look at: the eyes are parked, and the next target is adopted again
+g.base.rl.lidar_angles_show[:] = []
+g.base.rl.lidar_distances_show[:] = []
+st = g.step(now=200.0)
+check("nothing in range parks the pupils", link.writes[-1] == b"T -1 -1\n",
+      f"got {link.writes[-1]}")
+check("and the parked gaze publishes no aim, so nothing stale can be read as current",
+      st["aim"] is None and st["target"] is None, f"got {st['aim']} {st['target']}")
+g.base.rl.lidar_angles_show[:] = [math.radians(60.0 + 180.0)]
+g.base.rl.lidar_distances_show[:] = [300.0]
+g.step(now=200.2)
+check("the first aim after a gap adopts the new target",
+      link.writes[-1] == b"T 0 50\n", f"got {link.writes[-1]}")
+
 
 # ── summary ───────────────────────────────────────────────────────────────────
 print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} checks passed")
