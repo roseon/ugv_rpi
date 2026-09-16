@@ -215,7 +215,11 @@ def main():
     check("the voice's words are Minionese",
           not re.search(r"\b(the|is|please)\b", spoken, re.I), spoken)
     check("the opening word is the corpus's", spoken.split()[0].lower() in lang.starts, spoken)
-    check("the SSML is still the Minion register", 'pitch="+40%"' in ssml_text and 'rate="+28%"' in ssml_text)
+    check("the SSML is still the Minion register",
+          'pitch="+40%"' in ssml_text and 'rate="%s"' % voice.RATE in ssml_text)
+    # The pitch carries the register; the rate is what the user hears as speed.
+    # Pinned at or below natural so a future edit cannot quietly rush it again.
+    check("and it is not sped up past natural", float(voice.RATE.strip("%")) <= 0, voice.RATE)
     check("the SSML carries the words it will say", spoken in ssml_text, spoken)
     check("an empty request stays empty", voice.ssml("")[0] == "")
 

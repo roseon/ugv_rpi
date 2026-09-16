@@ -10,7 +10,7 @@ which caller happened to be written first.
 **Why the parameters look like this.** No commercial TTS ships the licensed
 Minion voice — it is performed, in an invented language, and it is not a voice
 token any service sells.  What makes speech read as a Minion is a small register
-pushed far up in pitch and spoken quickly; the *language* is ``minionese.py``,
+pushed far up in pitch; the *language* is ``minionese.py``,
 trained from the corpus the user supplied, and it is what turns a sentence into
 the words below.  It used to be six hardcoded interjections glued in front of the
 caller's English, which is English with a costume on, not Minionese.  A ``POST
@@ -42,11 +42,15 @@ AZURE_KEY = os.environ.get("AZURE_SPEECH_KEY", "702d957143704526a6687ac6cde18194
 AZURE_REGION = os.environ.get("AZURE_SPEECH_REGION", "eastus2")
 
 # ── the voice itself ──────────────────────────────────────────────────────────
-# A voice token to carry the pitch and rate, the two prosody controls that make
-# the register, and the interjections that make it sound like a Minion.
+# The register is the pitch: pushed far up, a small voice.  The rate is *not*
+# pushed up with it any more -- measured on this robot the same sentence took
+# 7.6 s at +28% against 11.0 s at -10%, and at the fast end the corpus's own
+# words ran together into something the user could not follow ("talking way too
+# fast").  Slower costs nothing to keep in step: the mouth is drawn from the WAV
+# that plays, so the face follows the voice wherever the rate goes.
 VOICE = "en-US-JennyNeural"
 PITCH = "+40%"
-RATE = "+28%"
+RATE = "-10%"
 
 _voice_lock = threading.Lock()          # one utterance at a time, robot-wide
 
@@ -84,8 +88,13 @@ def synth_rest(ssml_text, timeout=25):
         return r.read()
 
 
-def play_wav(wav_bytes, timeout=40):
-    """Play WAV bytes through the system default sink (the Bluetooth speaker)."""
+def play_wav(wav_bytes, timeout):
+    """Play WAV bytes through the system default sink (the Bluetooth speaker).
+
+    `timeout` is the caller's, and it has to follow the audio: this used to be a
+    fixed 40 s, which covered about 78 words at the old rate and covers about 55
+    at the current one, so a long answer would have been killed mid-sentence.
+    """
     fd, path = tempfile.mkstemp(suffix=".wav", dir="/tmp")
     try:
         with os.fdopen(fd, "wb") as f:
@@ -101,19 +110,21 @@ def play_wav(wav_bytes, timeout=40):
 def _speak_local(spoken):
     """Last resort with no network: a local engine, pitched the same way.
 
-    espeak-ng if it is installed (high pitch and speed are exactly what its
-    ``-p``/``-s`` control), otherwise pyttsx3.  Either way the mouth still moves,
-    on the text-derived envelope, because there is no WAV to measure.
+    espeak-ng if it is installed (high pitch is what its ``-p`` controls, and
+    ``-s`` is the words-per-minute to match the main voice's slower tempo -- 150
+    reads at about the pace measured above), otherwise pyttsx3.  Either way the
+    mouth still moves, on the text-derived envelope, because there is no WAV to
+    measure.
     """
     if subprocess.call(["/bin/sh", "-c", "command -v espeak-ng"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
-        subprocess.run(["espeak-ng", "-v", "en+f3", "-p", "99", "-s", "200", spoken],
+        subprocess.run(["espeak-ng", "-v", "en+f3", "-p", "99", "-s", "150", spoken],
                        timeout=60, check=False)
         return True
     try:
         import pyttsx3
         engine = pyttsx3.init()
-        engine.setProperty("rate", 200)
+        engine.setProperty("rate", 150)
         engine.say(spoken)
         engine.runAndWait()
         return True
@@ -141,7 +152,10 @@ def speak(text, timeout=25):
             if wav and wav[:4] == b"RIFF":
                 seq = speech_face.FACE.begin(spoken, wav)
                 try:
-                    play_wav(wav)
+                    # 30 s of slack over the audio's own length, measured by the
+                    # module that reads the WAV for the mouth.
+                    _levels, audio_s = speech_face.envelope_from_wav(wav)
+                    play_wav(wav, timeout=(audio_s or 0.0) + 30.0)
                 finally:
                     speech_face.FACE.end(seq)
                 return spoken

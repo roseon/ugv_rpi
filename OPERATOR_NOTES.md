@@ -635,3 +635,38 @@ Named gaps, all measured rather than assumed:
   every live line above came through the gaze's camera pass — that mode is
   selected over socket.io, so it was not exercised this pass.
 
+### The voice's speed is a measured choice, and it is no longer fast (Sep 16)
+
+The user's report: "it talking way too fast".  The register was two knobs pushed
+up together — `pitch="+40%"` **and** `rate="+28%"` — and only the pitch makes a
+Minion; the rate was just speed.  The same sentence was synthesized on the robot
+at five rates (the WAV length is the playback length, measured straight from
+Azure's output at 24 kHz/16-bit):
+
+| rate | the same sentence | per word |
+|---|---|---|
+| `+28%` (was) | 7.60 s | 0.51 s |
+| `+10%` | 8.85 s | 0.59 s |
+| `0%` | 9.60 s | 0.64 s |
+| **`-10%` (now)** | **10.95 s** | **0.73 s** |
+| `-20%` | 12.32 s | 0.82 s |
+
+`RATE` in `voice.py` is now `-10%`: **1.44× slower** than it was, and the pitch is
+untouched, because the character is in the pitch.  Nothing else had to change for
+the face: the mouth is drawn from the very WAV that plays, so it stretched with
+the audio — measured live through `POST /api/say`, the sentence played **11.35 s**
+with the mouth peaking at 0.84 opening and the same 90-frame curve (`window_s`
+1.5 s of curve at 60 sps).
+
+The no-network fallback was fast for the same reason and is now matched to the
+main voice (`espeak-ng -s 200` → `150`, `pyttsx3` rate 200 → 150), so a robot
+without its Azure link does not sound like a different, rushed robot.
+`minionese_selftest.py` now pins `rate <= 0` rather than naming one string, so a
+later edit cannot quietly rush it again the way this one did.
+
+One piece of scratch to delete rather than fix: `bt_synth.py` (git-ignored, so it
+cannot be committed, but present in the tree) is a one-use Bluetooth test that
+repeats the SSML **with the old `+28%` and with the subscription key hardcoded**.
+Nothing imports it; it should go, and that key was in the repo long enough to be
+worth rotating.
+
