@@ -23,7 +23,9 @@ import math
 import os
 import random
 import tempfile
+import textwrap
 import time
+import types
 
 import lance
 import perception
@@ -180,6 +182,60 @@ check("_decide() checks _planner_halted() before every wheel command",
 check("the avoider has a HOLD state to report while halted",
       any(isinstance(n, ast.Assign)
           and getattr(n.targets[0], "id", "") == "HOLD" for n in avoider.body))
+
+# ...and its commands keep arriving.  The chassis expires motion it has not
+# heard again (CMD_HEART_BEAT_SET, tutorial_en/08: 3 s by default), measured
+# here as ~3.5 s of travel from a single frame.  _send used to drop every repeat,
+# so once a heading settled the avoider stopped talking, the heartbeat stopped
+# the wheels and the robot sat still while the state machine said CRUISE.
+CHASSIS_HEARTBEAT_SEC = 3.0
+send = next(n for n in avoider.body
+            if isinstance(n, ast.FunctionDef) and n.name == "_send")
+keepalive = [n for n in ast.walk(app_tree) if isinstance(n, ast.Assign)
+             and getattr(n.targets[0], "id", "") == "SEND_KEEPALIVE_SEC"]
+seconds = ast.literal_eval(keepalive[0].value) if keepalive else None
+check("a held drive command is re-sent on a timer, not only when it changes",
+      bool(keepalive) and any(isinstance(n, ast.Attribute) and n.attr == "_sent_at"
+                              for n in ast.walk(send)), seconds)
+check("...and that timer is well inside the chassis heartbeat",
+      isinstance(seconds, (int, float)) and 0 < seconds < CHASSIS_HEARTBEAT_SEC,
+      seconds)
+
+# ── 0c. a pause is not overtaken by the tick that was already running ────────
+# pause(halt=True) clears _active and *then* sends its zeros, so a decision in
+# flight could put a motion frame on the wire after them, and the chassis drives
+# on that frame for the whole heartbeat.  Measured live, a halt was followed by
+# 0.570 m of wheel travel, and by 0.000 m when the zeros were the last thing the
+# chassis heard.  The method is run for real here against a base that records
+# what arrives: this is a race in an order the syntax tree cannot show.
+_src = open("app.py", encoding="utf-8").read()
+_ns = {"time": time, "SEND_KEEPALIVE_SEC": seconds}
+exec("import time\n" + textwrap.dedent(ast.get_source_segment(_src, send)), _ns)
+
+
+class _Recorder:
+    def __init__(self):
+        self.frames = []
+
+    def base_json_ctrl(self, data):
+        self.frames.append(data)
+
+
+_halt = type("Avoider", (), {})()
+_halt._base, _halt._sent_at = _Recorder(), 0.0
+_halt._last_L = _halt._last_R = 0.0
+_halt._active = True
+_send_fn = types.MethodType(_ns["_send"], _halt)
+_send_fn(0.3, 0.3)                      # driving: the frame goes out
+_after = len(_halt._base.frames)
+_halt._active = False                   # as pause(halt=True) leaves it
+_send_fn(0.0, 0.0)                      # ...and its own halt frame still goes
+_send_fn(0.3, -0.3)                     # the in-flight tick must not
+check("a paused avoider leaves no motion frame on the wire",
+      [f for f in _halt._base.frames[_after:] if f["L"] or f["R"]] == [],
+      _halt._base.frames[_after:])
+check("...while its own halt still reaches the chassis",
+      [f for f in _halt._base.frames[_after:] if not f["L"] and not f["R"]] != [])
 
 # ── 1. the refactored angle math is numerically identical ────────────────────
 print("--- 1. perception == the math it replaced (randomised) ---")
@@ -394,8 +450,9 @@ check("an object disk also saturates at HIT_MAX, not 65535",
 for _ in range(spatial_memory.HIT_MAX + 2):
     ocs._decay_locked(time.time() + 3600)
 peak_after = max(h for row in ocs._hits for h in row)
-check("an unobserved object disk also decays away",
-      peak_after == 0, peak_after)
+check("an unobserved object disk stops blocking, keeping only the memory of it",
+      peak_after == spatial_memory.MEM_FLOOR and not ocs.blocked(0.0, 1.0),
+      peak_after)
 
 # ── 6. pursuit: aim, smoothness, arrival, search, veto ──────
 print("--- 6. pursuit behaviors ---")
@@ -620,10 +677,10 @@ print("--- 10. place-referenced map + the learned area steering ---")
 ROOM = (-2.5, 2.5, -3.0, 2.0)      # xmin, xmax, ymin, ymax — metres, map frame
 
 
-def cast(pose, angles_rad):
+def cast(pose, angles_rad, room=ROOM):
     """Ranges (mm) from a map-frame pose to the room's walls — a synthetic LIDAR."""
     x, y, theta = pose
-    xmin, xmax, ymin, ymax = ROOM
+    xmin, xmax, ymin, ymax = room
     out = []
     for a in angles_rad:
         psi = theta + a
@@ -684,6 +741,72 @@ check("wheels claiming motion the scan denies are rejected", mem.motion == 'reje
       mem.motion)
 check("...and the pose stayed where the room puts it", mem.pose == before)
 
+# The move above is the bench case at full size.  What decides whether the map
+# is place-referenced in everyday driving is the *small* step: this LIDAR
+# publishes a revolution every 0.10 s (measured on the robot), so a revolution
+# carries 20 mm of travel at the slow speed and 35 mm at cruise — inside the
+# sensor's own repeatability.  The guard used to judge every revolution with an
+# 80 mm allowance, so every step this chassis can take passed it, and phantom
+# travel walked the frame 0.9 m over 70 ticks before the map noticed anything.
+# These memories are driven a revolution at a time at that scale: one where the
+# wheels spin and the room does not move, one where the two move together.
+per_rev = spatial_memory.FIT_EVERY_M / 5.0
+memP = spatial_memory.SpatialMemory()
+memP.observe_lidar(ANG, cast((0.0, 0.0, 0.0), ANG), odom=None, scan_id=101)
+seen = {memP.motion}
+for i in range(20):
+    memP.observe_lidar(ANG, cast((0.0, 0.0, 0.0), ANG), odom=(per_rev, per_rev),
+                       scan_id=102 + i)
+    seen.add(memP.motion)
+check("phantom travel a revolution at a time never moves the frame",
+      memP.pose == (0.0, 0.0, 0.0), memP.pose_status())
+check("...because the scan refuses those steps (%.0f mm each)" % (per_rev * 1000),
+      'rejected' in seen and 'accepted' not in seen, seen)
+
+memR = spatial_memory.SpatialMemory()
+memR.observe_lidar(ANG, cast((0.0, 0.0, 0.0), ANG), odom=None, scan_id=201)
+travelled = 0.0
+for i in range(20):
+    travelled += per_rev
+    memR.observe_lidar(ANG, cast((0.0, travelled, 0.0), ANG),
+                       odom=(per_rev, per_rev), scan_id=202 + i)
+check("...while the same travel with the room moving with it is followed",
+      travelled - spatial_memory.FIT_EVERY_M <= memR.pose[1] <= travelled,
+      memR.pose_status())
+
+# The grid is a bounded window on the place frame, and the robot drives out of
+# it: measured live, the pose had reached cell (152, 143) of a 0..120 grid, with
+# 0 of 9,624 remembered cells within 3 m of the robot and 0 of 267 live returns
+# landing inside the grid at all — nothing the sensors saw could be stored or
+# steer.  Driven past the keep radius here, the window has to slide under the
+# robot without moving any place in it.  The room is bigger than ROOM because
+# ROOM is 5 m deep, and walking out of it is a different test.
+WIDE = (-9.0, 9.0, -9.0, 5.0)
+memW = spatial_memory.SpatialMemory()
+memW.observe_lidar(ANG, cast((0.0, 0.0, 0.0), ANG, room=WIDE), odom=None,
+                   scan_id=601)
+step = spatial_memory.FIT_EVERY_M
+for i in range(1, 41):                       # 4 m of travel, past CENTRE_KEEP_M
+    memW.observe_lidar(ANG, cast((0.0, i * step, 0.0), ANG, room=WIDE),
+                       odom=(step, step), scan_id=601 + i)
+check("4 m of travel is followed, not refused, in a room it can drive in",
+      memW.motion == 'accepted', memW.pose_status())
+check("the robot is kept inside its own grid however far it drives",
+      abs(memW.pose[1]) <= spatial_memory.CENTRE_KEEP_M,
+      "%s of 4.0 m claimed" % memW.pose[1])
+check("...and a wall it has driven toward is still ahead of it, at its own place",
+      memW.blocked(0.0, 1.0) and not memW.blocked(0.0, 2.0), memW.pose_status())
+
+# A slip while turning is the same failure on the other axis: equal and opposite
+# wheel travel with the room standing still.
+memS = spatial_memory.SpatialMemory()
+memS.observe_lidar(ANG, cast((0.0, 0.0, 0.0), ANG), odom=None, scan_id=301)
+for i in range(10):
+    memS.observe_lidar(ANG, cast((0.0, 0.0, 0.0), ANG),
+                       odom=(-per_rev, per_rev), scan_id=302 + i)
+check("wheels claiming a turn the room does not show are refused too",
+      memS.pose == (0.0, 0.0, 0.0), memS.pose_status())
+
 # one revolution is counted once, however fast the planner ticks
 mem9 = spatial_memory.SpatialMemory()
 mem9.observe_lidar(ANG, cast((0.0, 0.0, 0.0), ANG), odom=None, scan_id=11)
@@ -691,6 +814,27 @@ once = mem9.busy_cells
 mem9.observe_lidar(ANG, cast((0.0, 0.0, 0.0), ANG), odom=None, scan_id=11)
 check("a scan already folded in is not counted again", mem9.busy_cells == once,
       "%d -> %d" % (once, mem9.busy_cells))
+
+# What is kept, and what stops mattering.  Evidence fades to MEM_FLOOR and stays
+# there, so the place survives in memory and in surroundings.json; blocking is
+# decided by MIN_HITS of recent evidence, so a cell the robot has stopped seeing
+# is remembered without being able to refuse a heading.  Decay is driven past
+# the horizon here rather than slept through.
+memF = spatial_memory.SpatialMemory()
+for sid in (401, 402):
+    memF.observe_lidar(ANG, cast((0.0, 0.0, 0.0), ANG), odom=None, scan_id=sid)
+seen = memF.busy_cells
+check("a wall 2 m ahead blocks while it is being seen",
+      seen > 0 and memF.blocked(0.0, 2.0), memF.pose_status())
+future = time.time() + 2 * spatial_memory.DECAY_SEC
+for i in range(20):
+    memF._decay_locked(future + i * (spatial_memory.DECAY_SEC + 1))
+check("the place is still remembered long after the robot looked away",
+      memF.busy_cells == seen, "%d -> %d" % (seen, memF.busy_cells))
+check("...but stale evidence cannot refuse a heading any more",
+      not memF.blocked(0.0, 2.0))
+check("...and the cells are held at the floor, not decaying away",
+      all(h == spatial_memory.MEM_FLOOR for _x, _y, h in memF.cells(min_hits=1)))
 
 # the map steers: a remembered wall refuses the heading into it, and a map that
 # refuses everything falls back to what the live scan says

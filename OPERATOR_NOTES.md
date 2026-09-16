@@ -165,7 +165,7 @@ form field), which is how a previous pass concluded the chassis could not move.
 With the correct form the wheels turn: a 4 s forward command moved the front cone
 459 -> 179 mm and advanced the ESP32 odometry in the commanded direction.
 
-## Mapping is short-horizon by design, and steering does not wobble
+## What the map keeps, and why steering does not wobble
 
 5. **The learned map must be able to forget.** Hit counts used to be capped at
 65535 and decayed one per `DECAY_SEC`, so a cell observed for a minute held
@@ -174,11 +174,17 @@ every direction — measured `clearance = 0.000` for all 13 headings — so the
 `W_MEM` term was a constant offset and the learned map contributed nothing to
 steering. Now `HIT_MAX = 5`, the same ceiling applies to camera-fused object
 disks (`observe_object` used to climb to 65535 independently), and `load()`
-clamps an old file on read. An unobserved cell clears in ~30 s at
-`DECAY_SEC = 6`. This is a short-horizon obstacle memory, which is the honest
-shape for a robot-centric grid with no localisation. Live after the fix: max
-hits 5, hit histogram spread 1..5, and the 13 heading scores spanning -0.15 to
-+3.10 (they used to differ only by the live-LIDAR term).
+clamps an old file on read. Live after the fix: max hits 5, hit histogram spread
+1..5, and the 13 heading scores spanning -0.15 to +3.10 (they used to differ only
+by the live-LIDAR term).
+
+   What decays is the right to *block*, not the memory: `MEM_FLOOR = 1` holds an
+   observed cell in the map (and in `surroundings.json`) while dropping it below
+   `MIN_HITS = 3`, so the place the robot has driven through is kept and a chair
+   that has since moved cannot refuse a heading forever. Live after the floor:
+   8,685 remembered cells, 3,006 of them beyond the LIDAR's own 6 m reach. Before
+   it, 0 of 810 did — the map was a picture of the current view, which is what
+   "it never learns the area" looked like from the outside.
 
    Decay only runs inside `observe_lidar`, i.e. while the planner ticks. A
    paused robot keeps its last map — deliberate — and the first tick after
@@ -766,6 +772,96 @@ until the stray `numpy/` was removed from the venv.  A model built this way is t
 same detector but not the same bytes (the simplifier never runs): over one frame its
 raw output was bit-identical to the shipped file (max absolute difference
 0.000e+00), with the same box and confidence to six decimals.
+
+## The frame follows places the room agrees with, and a held command is re-sent (Sep 16, later)
+
+**The odometry guard could not see the steps this robot takes.**  `spatial_memory`
+confirmed wheel travel against the scan before believing it, with an 80 mm
+allowance. This LIDAR publishes a revolution every **0.101 s** (measured on the
+robot: 1798 frames/s, scan stamps 0.101 s apart), so one revolution carries 20 mm
+of travel at the slow speed and 35 mm at cruise — every step, at every speed this
+chassis drives, was smaller than the allowance. On the robot's own scans the fit
+scored 1.000 at the true pose and 0.933 for a phantom 35 mm step: above the
+acceptance threshold, so phantom travel was believed. Driven headlessly with the
+real code, 0.9 m of phantom travel in 70 ticks walked the pose and reported
+`accepted` every time. That is the smearing the frame exists to stop, and live it
+was visible as a pose the robot had carried **14.7 m** away from the origin of a
+12 m grid.
+
+**The frame is a bounded window, and the robot had driven out of it.**  
+`GRID_SIZE = 121` is ±6 m and nothing brought the map back to the middle: live,
+the pose had reached cell **(152, 143) of a 0..120 grid**, with **0 of 9,624
+remembered cells within 3 m of the robot** and **0 of 267 live returns landing
+inside the grid at all** — the robot was in territory its map could not
+represent, so nothing the sensors saw could be stored or steer, which is what
+"it never learns the area" looked like from the outside.  The window now slides
+under the robot when it is more than `CENTRE_KEEP_M = 3` m from the middle: by a
+whole number of cells, so no place is resampled, with the pose moved by the same
+amount and the reference scan re-anchored, so the guard still judges motion (and
+a file written while the pose was outside the array is re-anchored on load).
+Live on two drives after it: **292/292** and **255/255** of the close returns sat
+on a remembered cell and all of them projected inside the grid, with the pose
+held at cells (60, 61) and (58, 73).  `selfdrive_selftest` drives 4 m in a room
+big enough to drive in and checks the wall it approached is still ahead at its
+place — the smaller synthetic room is 5 m deep and walking out of it is a
+different test, which is how the first version of that check passed while the
+pose never moved.
+
+Now `FIT_TOL_M = 0.025` — on the same scans the truth scores 0.992, a phantom
+35 mm step 0.525, 100 mm 0.042 and a phantom 10 cm + 5° turn 0.109 — and the
+wheels' claim is *accumulated* to `FIT_EVERY_M = 0.10` before a scan judges it,
+because one revolution is inside the sensor's own repeatability (stationary
+scan-to-scan spread: median 0–1 mm, p90 13 mm). The pose only ever moves to a
+place the room agrees about; held travel is one cell. Live after the fix, on a
+30 s drive: 20 accepted / 4 rejected chunk verdicts, 100% of close LIDAR
+returns (190/190) remembered within ±1 cell of where the scan puts them, and
+81% of them recent enough to block. `selfdrive_selftest.py` now pins the case
+the old harness missed — phantom travel a revolution at a time, 20 mm and a
+claimed turn, which must never move the frame, against the same travel with the
+room moving with it, which must be followed.
+
+**A drive command expires on this chassis.**  `CMD_HEART_BEAT_SET`
+(`tutorial_en/08`, default 3 s) stops the wheels when no motion frame arrives;
+measured here, one frame at 0.08 turned the wheels for 0.248 m and then stopped
+by themselves ~3.5 s later. `LidarAvoider._send` suppressed every repeat, so once
+the chosen heading settled the avoider stopped talking — and the robot sat still
+while the state machine still reported `CRUISE` (sampled live: avoidance
+ACTIVE/CRUISE, front steady at ~1 m, wheel counters frozen), lurching only when
+a new heading briefly changed the command. `SEND_KEEPALIVE_SEC = 1.0` re-sends a
+held command; the web UI has always re-sent on a 2 s timer for the same reason.
+Live after the fix: CRUISE → SLOW → EVADE → CRUISE as it met things, **5.08 m in
+13.9 s at 0.364 m/s with no stall**, where a constant command used to die after
+~3.5 s.  Two later drives measured **4.95 m in 14.8 s** and **5.53 m in 14.9 s**
+at 0.33–0.37 m/s with no interval longer than the 0.25 s sampling gap.
+
+**A pause could be overtaken by the tick already running.**  `pause(halt=True)`
+clears `_active` and *then* sends its zeros, so a `_decide` call already in
+flight could put a motion frame on the wire after them — and the chassis drives
+on that frame for the whole heartbeat above.  Measured live: a halt was followed
+by **0.570 m** of wheel travel, and by **0.000 m** once the zeros were the last
+thing the chassis heard.  `_send` now refuses to emit a motion frame while the
+avoider is inactive; the joystick does not come through `_send`, so manual
+driving while paused is unaffected, and `selfdrive_selftest` runs the method
+against a recording base — mutating the guard back reproduces the stray
+`L=0.3 R=-0.3` frame after the halt.
+
+A second gotcha this exposed: any client command over the websocket calls
+`avoider.pause()` (8 s of manual control), so a browser or Command Center
+sending frames — including a stray `L=0.5 R=-0.5` followed by zeros — takes the
+wheels off the avoider while it is driving. That is by design for a joystick;
+it is worth knowing when "self-drive did nothing" is observed.  The watchdog
+that re-arms after those 8 s re-enables self-drive as well as avoidance
+(`manual_control_watchdog`), so a robot that was switched off comes back on by
+itself — observed live: self-drive off, then `active true` and driving with
+wheel counters climbing, until the disable was repeated.  Disabling avoidance
+(`/lidar_avoidance?enable=false`) clears the watchdog's stamp, which is what
+makes a stop stick; `self_drive.enable()` in the watchdog re-arms driving, which
+is the operator-facing surprise.
+
+The map file built before this fix was moved aside on the robot as
+`surroundings.json.pre-frame-fix` and the grid cleared, because a pose that had
+walked 14.7 m makes its cells uninterpretable. The remembered area is bounded by
+`GRID_SIZE = 121` (±6 m) — the robot had already driven outside it.
 
 **Volume.**  `set_audio_volume()` was pygame's music mixer, and the robot's speech
 never goes through it — it is played by `paplay` to the Bluetooth sink, which sat

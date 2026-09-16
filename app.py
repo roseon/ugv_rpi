@@ -84,6 +84,11 @@ MANUAL_PAUSE_SEC = 8.0  # seconds after last joystick input before avoider resum
                        # (3s was short enough that the avoider could re-engage
                        # between two deliberate maneuvers and fight the next one)
 LOOP_HZ         = 10
+SEND_KEEPALIVE_SEC = 1.0  # re-send a held command this often.  The chassis
+                       # expires motion it has not heard again (CMD_HEART_BEAT_SET,
+                       # tutorial_en/08: {"T":136,"cmd":3000} stops the wheels 3 s
+                       # after the last motion frame; measured here as ~3.5 s of
+                       # travel from one frame), so a command has to keep arriving.
 
 
 # Sector/turn helpers live in perception.py (they own the lidar frame
@@ -113,6 +118,7 @@ class LidarAvoider:
         self._thread    = None
         self._last_L    = 0.0
         self._last_R    = 0.0
+        self._sent_at   = 0.0    # when the held command was last put on the wire
         self._cooldown  = 0.0
         self._hold_until = 0.0   # keep the evade turn going until this time
         self._last_bias  = 1.0   # direction of the last evade/reverse maneuver
@@ -327,13 +333,38 @@ class LidarAvoider:
         self._cooldown = time.time() + 0.3
 
     def _send(self, L, R):
-        """Send differential-drive command, skipping duplicates."""
+        """Send the drive command, skipping duplicates but never going quiet.
+
+        A constant command is not a standing instruction on this chassis: it
+        stops the wheels a heartbeat after the last motion frame it receives
+        (CMD_HEART_BEAT_SET, tutorial_en/08 — the default is 3 s, and a single
+        frame measured here turned the wheels for ~3.5 s).  Suppressing the
+        repeats — all this used to do — therefore meant the robot sat still
+        while the avoider still reported CRUISE: sampled live, avoidance
+        ACTIVE/CRUISE with a steady ~1 m of clearance and the wheel counters
+        frozen, then a burst of travel whenever a new heading briefly changed
+        the command.  The web UI has always re-sent its held stick value on a
+        timer for the same reason (templates/control.js, every 2 s); this is
+        that keepalive, at 1 s so one dropped frame cannot reach the heartbeat.
+        """
         L = round(L, 3)
         R = round(R, 3)
-        if L == self._last_L and R == self._last_R:
+        if (L or R) and not self._active:
+            # pause(halt=True) clears _active and *then* sends its zeros, so a
+            # decision already in flight must not put a motion frame on the wire
+            # after them: the chassis would drive on that frame for the whole
+            # heartbeat.  Measured live, a halt was followed by 0.570 m of wheel
+            # travel, and by 0.000 m when the zeros were the last thing the
+            # chassis heard.  The joystick does not come through here, so manual
+            # driving still works while the avoider is paused.
+            return
+        now = time.time()
+        if (L == self._last_L and R == self._last_R
+                and now - self._sent_at < SEND_KEEPALIVE_SEC):
             return
         self._last_L = L
         self._last_R = R
+        self._sent_at = now
         self._base.base_json_ctrl({"T": 1, "L": L, "R": R})
 
 
@@ -1071,9 +1102,11 @@ def selfdrive_status():
 def surroundings():
     """Learned surroundings for the UI: occupancy cells (map frame, m) + objects.
 
-    The cells are places, not bearings: the frame is the robot's own position
-    when the memory was last cleared, and `map.pose` is where the robot is in
-    it, so the same wall keeps one set of cells as the robot drives.
+    The cells are places, not bearings: the frame stays rigid as the robot
+    drives, so the same wall keeps one set of cells, and `map.pose` is where the
+    robot is in it.  The grid is a bounded window that slides under the robot
+    (spatial_memory.CENTRE_KEEP_M), so the origin is a lattice point rather than
+    the place the memory was cleared — the drawing is the same either way.
     """
     return jsonify({
         'cells': [{'x': mx, 'y': my, 'hits': h}

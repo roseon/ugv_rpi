@@ -21,14 +21,39 @@ was when the memory was last cleared.
 0.30 came back as 0.589 m of wheel travel while the LIDAR saw the room move less
 than 10 mm — wheels turning, chassis not (lifted or slipping).  Integrating that
 would walk every remembered wall 0.59 m across the map, which is exactly the
-smearing a robot-centric grid suffered.  So each step is *confirmed by the scan*:
-the new pose is kept only if the scan fits the map about as well as the old pose
-did.  Real motion carries the scan with it and is accepted; phantom motion is
-rejected and the map stays where the room says it is.
+smearing a robot-centric grid suffered.  So wheel travel is *confirmed by the
+scan* before it is believed, and the pose only ever moves to a place the room
+agrees about.
 
-Decay is unchanged and still short-horizon (HIT_MAX/DECAY_SEC): evidence for a
-cell that stops being observed fades away, so this is a map of what the robot has
-seen lately, and the persisted file is a starting picture rather than forever.
+**Why the check accumulates.**  This sensor publishes a revolution every 0.10 s
+(measured: 1798 frames/s, scan stamps 0.101 s apart), so one revolution of this
+chassis is 20 mm of travel at the slow speed and 35 mm at cruise.  A step that
+small is inside the sensor's own repeatability, so a per-scan test cannot tell
+real motion from a phantom one at any speed this robot drives: it is now judged
+once the wheels claim FIT_EVERY_M of travel, where the two are 30x apart on the
+robot's own scans (at the true pose the fit is 0.992; a phantom 100 mm step
+scores 0.042).  Held travel is 10 cm — one cell — so the map is never marked
+from a pose the room has not agreed to.
+
+Evidence decays to MEM_FLOOR and stops there, so the place the robot has driven
+through is *kept* — in memory and in surroundings.json — instead of being
+forgotten within seconds of leaving the sensor's reach.  What decays away is the
+right to refuse a heading: blocking is decided by MIN_HITS of *recent* evidence,
+so a cell the robot saw minutes ago is remembered without being able to veto a
+heading, which is what keeps a chair that has since moved from steering forever.
+Measured before the floor existed: after a 5 m drive, 0 of 810 remembered cells
+lay beyond the LIDAR's own 6 m reach — the map was the current view, not a map.
+
+**The grid is a window on the frame, and the window follows the robot.**  A
+bounded array cannot hold an unbounded place frame, so when the robot drives
+more than CENTRE_KEEP_M from the middle of the grid the cells are shifted by a
+whole number of cells — so the lattice is not resampled and every cell keeps the
+place it had — and the pose moves by exactly the same amount.  What falls off
+the far edge is what the LIDAR can no longer reach from here.  Without it the
+robot drives out of its own map: measured live, the pose had reached cell
+(152, 143) of a 0..120 grid, with 0 of 9,624 remembered cells within 3 m of the
+robot and 0 of 267 live returns landing inside the grid at all, so nothing the
+sensors saw could be stored or steer anything.
 """
 
 import json
@@ -47,6 +72,8 @@ MEM_VERSION = 3          # bumped when the map's frame changed: v2 was
 
 GRID_SIZE    = 121       # cells per side (±6 m at 10 cm)
 CELL_M       = 0.10      # metres per cell
+CENTRE_KEEP_M = 3.0      # the robot is kept this close to the grid's centre;
+                         # beyond it the window slides under the robot (below)
 MIN_HITS     = 3         # occupied evidence before a cell counts as blocked
 MIN_FREE     = 3         # ray passes before a cell counts as seen-and-clear
 HIT_MAX      = 5         # occupied evidence saturates here.  The count used to
@@ -55,6 +82,9 @@ HIT_MAX      = 5         # occupied evidence saturates here.  The count used to
                          # never clear it: after a drive the grid read "blocked"
                          # in every direction and the learned map stopped
                          # contributing to steering at all.
+MEM_FLOOR    = 1         # ...and decays to this and stays: the cell is
+                         # remembered as seen (busy_cells, the saved file) but is
+                         # under MIN_HITS, so it no longer blocks a heading.
 FREE_MAX     = 5         # ...and so does free evidence
 DECAY_SEC    = 6.0       # stale evidence loses a count after this long
 OBJ_RANGE_MAX = 3.0      # metres — objects beyond this are remembered, not avoided
@@ -63,9 +93,16 @@ OBJ_DEDUPE_M = 0.5       # metres — merge a sighting into a known object withi
 DET_MIN_CONF = 0.30      # ignore camera boxes below this confidence
 
 # ── the frame guard ───────────────────────────────────────────────────────────
-FIT_TOL_M     = 0.08     # a scan point this close to remembered evidence counts
+# Measured on this robot against real scans with the robot stationary (so any
+# fit below the ceiling is noise): at the true pose the fit is 0.992 with
+# FIT_TOL_M and 0.983 even at 15 mm, while a phantom 35 mm step scores 0.525, a
+# phantom 100 mm step 0.042 and a phantom 10 cm + 5 deg turn 0.109.  The
+# allowance used to be 80 mm, which put the truth at 1.000 and a phantom 35 mm
+# step at 0.933 — above the acceptance threshold, so every step this chassis
+# can take was believed.
+FIT_TOL_M     = 0.025    # a scan point this close to remembered evidence counts
+FIT_EVERY_M   = 0.10     # wheel travel to accumulate before the scan judges it
 FIT_EVERY     = 3        # fit every Nth ray; 120 of ~360 is just as decisive
-FIT_MIN_CELLS = 40       # below this the map has nothing to contradict with
 FIT_SLACK     = 0.12     # the new pose may fit this much worse than the old one
                          # and still be believed
 FREE_EVERY    = 2        # mark free space every Nth ray (the occupied end of
@@ -84,10 +121,11 @@ class SpatialMemory:
         self.pose = (0.0, 0.0, 0.0)   # map frame: x = left, y = forward, theta
         self.motion = 'unknown'    # accepted | rejected | unchecked | waiting
         self.motion_m = 0.0        # how far the last wheel step claimed
-        self._pending = (0.0, 0.0)     # wheel travel not yet checked against a scan
-        self._scan_id = None           # the LIDAR revolves about once a second
-        self._prev_pose = None         # pose when the previous scan was taken
-        self._prev_bins = None         # ...and that scan, as range by bearing
+        self._pending = (0.0, 0.0)     # wheel travel since the last scan was fed
+        self._scan_id = None           # identifies the revolution (0.10 s apart)
+        self._held = (0.0, 0.0)        # wheel travel not yet judged by a scan
+        self._ref_pose = None          # pose the reference scan was taken from
+        self._ref_bins = None          # ...and that scan, as range by bearing
         self._lock = threading.Lock()
         self.path = path
         self.load()
@@ -97,6 +135,40 @@ class SpatialMemory:
         cx = GRID_SIZE // 2 + int(round(wx / CELL_M))
         cy = GRID_SIZE // 2 - int(round(wy / CELL_M))   # +y forward -> up
         return max(0, min(GRID_SIZE - 1, cx)), max(0, min(GRID_SIZE - 1, cy))
+
+    def _recentre_locked(self):
+        """Slide the grid under the robot once it drifts more than CENTRE_KEEP_M.
+
+        The shift is a whole number of cells, so nothing is resampled: a cell
+        keeps the place it had, and the pose moves by exactly the same amount.
+        Called with the lock held, and only from `_remember_scan` (which
+        re-anchors the reference from the shifted pose) and `load`.
+        """
+        kx = int(round(self.pose[0] / CELL_M))
+        ky = int(round(self.pose[1] / CELL_M))
+        keep = int(round(CENTRE_KEEP_M / CELL_M))
+        if abs(kx) <= keep and abs(ky) <= keep:
+            return False
+
+        def shifted(grid, fill):
+            out = [[fill] * GRID_SIZE for _ in range(GRID_SIZE)]
+            for x in range(GRID_SIZE):
+                sx = x + kx
+                if not 0 <= sx < GRID_SIZE:
+                    continue
+                src, dst = grid[sx], out[x]
+                for y in range(GRID_SIZE):
+                    sy = y - ky
+                    if 0 <= sy < GRID_SIZE:
+                        dst[y] = src[sy]
+            return out
+
+        self._hits = shifted(self._hits, 0)
+        self._free = shifted(self._free, 0)
+        self._last = shifted(self._last, 0.0)
+        self.pose = (self.pose[0] - kx * CELL_M,
+                     self.pose[1] - ky * CELL_M, self.pose[2])
+        return True
 
     def _blocked_locked(self, wx, wy, min_hits=MIN_HITS):
         cx, cy = self._cell(wx, wy)
@@ -223,35 +295,48 @@ class SpatialMemory:
     def _step_pose(self, angles, distances):
         """Move the pose by the wheel travel since the last scan, if the scan agrees.
 
-        Called with the lock held, once per revolution.
+        The wheels' claim is held until it is big enough to judge (FIT_EVERY_M),
+        because one revolution is under the sensor's own repeatability — see the
+        module docstring.  Called with the lock held, once per revolution.
         """
         claimed = self._pending
         self._pending = (0.0, 0.0)
         self.motion_m = 0.5 * (claimed[0] + claimed[1])
-        if self._prev_bins is None:
+        if self._ref_bins is None:
             # The first scan has nothing to be checked against.
             self.pose = pose_step(self.pose, claimed[0], claimed[1])
             self.motion = 'unchecked'
             self._remember_scan(angles, distances)
             return
         if abs(claimed[0]) < 1e-4 and abs(claimed[1]) < 1e-4:
-            self.motion = 'accepted'          # claimed nothing, nothing to check
-            self._remember_scan(angles, distances)
+            # Claimed nothing, nothing to check.  The reference stays the room
+            # as it looks now, so a scan kept from minutes ago cannot judge a
+            # move made after somebody has since moved the furniture.
+            self.motion = 'accepted'
+            if self._held == (0.0, 0.0):
+                self._remember_scan(angles, distances)
             return
-        candidate = pose_step(self.pose, claimed[0], claimed[1])
+        self._held = (self._held[0] + claimed[0], self._held[1] + claimed[1])
+        if 0.5 * (abs(self._held[0]) + abs(self._held[1])) < FIT_EVERY_M:
+            self.motion = 'waiting'           # too small for the scan to judge
+            return
+        candidate = pose_step(self.pose, self._held[0], self._held[1])
         fits_new = self._fit_locked(candidate, angles, distances)
-        fits_now = self._fit_locked(self.pose, angles, distances)
-        if fits_new >= fits_now - FIT_SLACK:
+        fits_ref = self._fit_locked(self.pose, angles, distances)
+        self._held = (0.0, 0.0)
+        if fits_new >= fits_ref - FIT_SLACK:
             self.pose = candidate
             self.motion = 'accepted'
         else:
-            # The room says the robot did not move.  Drop the step and keep the
-            # map where the scan puts it; the alternative is walls that walk.
+            # The room says the robot did not move.  Drop the travel and keep
+            # the map where the scan puts it; the alternative is walls that
+            # walk, which is the smearing this whole frame exists to stop.
             self.motion = 'rejected'
         self._remember_scan(angles, distances)
 
     def _remember_scan(self, angles, distances):
-        """Keep this scan as range-by-bearing, for the next step to be checked against."""
+        """Keep this scan as range-by-bearing, for the next move to be judged against."""
+        self._recentre_locked()      # the window has to stay under the robot
         bins = [None] * 360
         for a, d in zip(angles, distances):
             if d <= 0 or d > 6000:
@@ -259,7 +344,7 @@ class SpatialMemory:
             i = int(round(math.degrees(a))) % 360
             if bins[i] is None or d < bins[i]:
                 bins[i] = float(d)
-        self._prev_pose, self._prev_bins = self.pose, bins
+        self._ref_pose, self._ref_bins = self.pose, bins
 
     def _fit_locked(self, pose, angles, distances, tol_m=FIT_TOL_M):
         """How well this scan, seen from `pose`, reproduces the previous scan.
@@ -277,8 +362,8 @@ class SpatialMemory:
                 continue
             mx, my = point_from_scan(a, d)
             wx, wy = robot_to_world(pose, mx, my)
-            mx, my = world_to_robot(self._prev_pose, wx, wy)
-            was = self._prev_bins[int(round(math.degrees(math.atan2(mx, my)))) % 360]
+            mx, my = world_to_robot(self._ref_pose, wx, wy)
+            was = self._ref_bins[int(round(math.degrees(math.atan2(mx, my)))) % 360]
             if was is None:
                 continue
             total += 1
@@ -291,7 +376,7 @@ class SpatialMemory:
             for y in range(GRID_SIZE):
                 if now - self._last[x][y] <= DECAY_SEC:
                     continue
-                if self._hits[x][y] > 0:
+                if self._hits[x][y] > MEM_FLOOR:
                     self._hits[x][y] -= 1
                 if self._free[x][y] > 0:
                     self._free[x][y] -= 1
@@ -365,6 +450,10 @@ class SpatialMemory:
                 pose = data.get('pose')
                 if isinstance(pose, list) and len(pose) == 3:
                     self.pose = (float(pose[0]), float(pose[1]), float(pose[2]))
+                # A file written before the window followed the robot can carry
+                # a pose outside the array; bring the window under it before
+                # anything reads a cell through that pose.
+                self._recentre_locked()
             print("[memory] loaded surroundings memory: "
                   f"{self.busy_cells} busy cells, {self.free_cells} known clear, "
                   f"{len(self.objects)} objects, pose {self.pose_status()['pose']}")
@@ -404,7 +493,8 @@ class SpatialMemory:
             self.pose = (0.0, 0.0, 0.0)
             self.motion, self.motion_m = 'unknown', 0.0
             self._pending = (0.0, 0.0)
+            self._held = (0.0, 0.0)
             self._scan_id = None
-            self._prev_pose, self._prev_bins = None, None
+            self._ref_pose, self._ref_bins = None, None
         print("[memory] surroundings memory cleared")
         return True
