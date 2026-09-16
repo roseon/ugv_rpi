@@ -309,7 +309,7 @@ supplied. What that changed, and what it cost:
 |---|---|
 | `eyes_tft.ino` scene | one lens per panel: black strap knuckle at each side, then the goggle ring `r=114` (metal `#B9BEC2`, `#8A9095` outline), the yellow eyelid ring `r=105` (`#F5C842`), the white sclera `r=95`, and the brown iris `r=32` (`#9B4A24`) with a `r=16` pupil and a `r=6` white highlight up-left. RGB565 values were computed, not eyeballed (`0xBDF8`, `0x8C92`, `0xF648`, `0x9A44`). |
 | `eyes_tft.ino` gaze | the iris travel limit is now `sclera - iris - 2 = 61 px` instead of 69, because the goggle's two bands shrank the white the iris is allowed on. A per-axis clamp would push it onto the yellow at diagonal gazes, so it stays the unit-vector rule. |
-| `face_screen.py` + `MouthView.cs` | the mouth, from the reference's own proportions: yellow lips (`#F7CE4A` top, `#E3AA2E` lower, `#C98B1E` edge), maroon interior (`#6E1B2A`, `#450E19`), a lip band `0.14` of the mouth's half-width, a jaw opening to `1.05` of it, 7 white teeth with 1 px gaps hanging from the top of the opening, 5 more rising from the bottom once it is open, and a red tongue (`#E06B6B`, `#B84F4E`) in the throat between them. Both files carry these same factors; the outlines differ on purpose (a bezier with a cupid's bow on the desktop, an ellipse ring on the panel). |
+| `face_screen.py` + `MouthView.cs` | the mouth, from the reference's own proportions: yellow lips (`#F7CE4A` top, `#E3AA2E` lower, `#C98B1E` edge), maroon interior (`#6E1B2A`, `#450E19`), a lip band `0.14` of the mouth's half-width, a jaw opening to `1.05` of it, 7 white teeth with 1 px gaps hanging from the top of the opening, 5 more rising from the bottom once it is open, and a red tongue (`#E06B6B`, `#B84F4E`) in the throat between them. Both files carry these same factors **and draw the same two arcs**: the mouth is a smile, not an oval — its upper and lower edges are arcs through the same corners, the upper shallow and the lower deep, so the shape is a banana with the corners lifted, and the lift grows with the jaw (`bend = open_h/2 + hw * (0.07 + 0.22 * smile)`) so it stays a smile when the mouth is wide open. On the panel the arcs are sampled (`mouth_edges`, `mouth_polygon`); on the desktop each edge is one quadratic bezier, whose control point is twice the arc's apex less the corners it joins — the same curve, not a redrawing of it. |
 
 Measured, since an Uno with no panel attached cannot be photographed:
 
@@ -328,16 +328,35 @@ Measured, since an Uno with no panel attached cannot be photographed:
   wide and 179 px closed → 257 px open, against the panel's 539/253 for the same
   jaw; lip ~22,000 px, teeth 25,000 → 40,000 px, maroon 3,500 → 8,800 px, tongue
   0 → 8,100 px as it opens.
+- **The smile, measured on the glass** (same grim capture, same palette classifier,
+  before and after this change): before, the mouth was 547 × 90 px and the corners
+  sat **36 px inside the middle's span on both edges** — 190..279 px at the middle
+  against 226..243 px at the tips, symmetric, which is an ellipse. After, the mouth
+  is 548 px wide × 116 tall and **the corners sit 27 px above the middle along the
+  top edge and 109 px along the bottom edge** (at rest); mid-sentence, 22/109 px
+  with a 2,478 px tooth row following the arc and the throat maroon beneath it. The same measurement on the desktop's big face, captured while the
+  robot spoke through the app: a 474 × 103 px lip blob whose corners ride 16 px
+  above the middle on the top edge and 101 px on the bottom — the panel's shape,
+  drawn by the other renderer.
+- **The shape is checked in pixels, not formulas** (`face_screen.py --selftest`,
+  run on the robot: 0 failures). It asserts that both edges **rise** at the
+  corners (an oval's are 0 and 0 — which is exactly what the panel drew for as
+  long as this mouth existed, and every formula check passed), that the lip band is
+  one thickness across the deep part (31–35 px of a 33 px lip), the palette inside
+  the mouth, teeth and tongue never outside the opening, the reference's
+  proportions, and prints an ASCII map of the result.
 
 The panel's mouth used to be built from stacked filled ellipses — an outer ring, an
 inner fill and a separate lower lobe — with a fixed highlight ellipse placed on the
 lower lip by a formula that had nothing to do with the band. On the glass that read
 as two yellow lobes with a pale orb floating on them, which is the photograph the
-user sent. It is now one ring plus an opening, the teeth rows follow the opening's
-ellipse (so nothing needs clipping), and `face_screen.py --selftest` measures all of
-it in pixels — band evenness at four radii, the palette inside the mouth, teeth and
-tongue never outside the opening, the mouth's share of the panel, and an ASCII map
-of the shape — because the formulas passed while the panel looked wrong.
+user sent. It is now one ring plus an opening, the tooth rows are cut to the arc
+they hang from (so nothing needs clipping), and `face_screen.py --selftest` measures
+all of it in pixels — band evenness across the mouth, the palette inside the mouth,
+teeth and tongue never outside the opening, the mouth's share of the panel, the
+rise of both edges at the corners, and an ASCII map of the shape — because the
+formulas passed while the panel looked wrong, and kept passing while it drew a flat
+oval where the reference draws a grin.
 
 **The Uno is now at 87% of flash (28,082 bytes, 1,232 bytes of RAM free)**, down
 from 99% (32,162 bytes, **94 bytes free**). The `ST7735` and `ILI9341` paths that
