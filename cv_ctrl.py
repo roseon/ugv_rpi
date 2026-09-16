@@ -343,16 +343,22 @@ class OpencvFuncs():
                             "dog", "horse", "motorbike", "person", "pottedplant", "sheep",
                             "sofa", "train", "tvmonitor"]
 
-        # YOLOv8 model for broader object detection (80 COCO classes)
+        # The object detector (80 COCO classes).  detector.py is the one place
+        # that names a model and it runs the ONNX through OpenCV's DNN, roughly
+        # three times faster than torch on this CPU — which is what pays for the
+        # bigger model (its header carries the measurements).  Still called
+        # `yolo_model` because object_speech builds the spoken vocabulary from
+        # its `.names`.
         self.yolo_model = None
         self.last_detections = []  # Latest detection results for Lance to access
         self.last_frame_for_detect = None  # Latest frame for on-demand detection
         try:
-            from ultralytics import YOLO
-            self.yolo_model = YOLO('yolov8n.pt')  # nano model — fast on Pi
-            logging.info("YOLOv8 loaded successfully")
+            import detector
+            self.yolo_model = detector.Detector(root=thisPath)
+            self.yolo_model.load()
+            logging.info("object detector loaded: %s", self.yolo_model.model_file)
         except Exception as e:
-            logging.warning("YOLOv8 not available, falling back to MobileNet: %s", e)
+            logging.warning("object detector not available, falling back to MobileNet: %s", e)
 
         # Open-vocabulary learning (YOLO-World): knows COCO + every object Lance
         # has been taught. Self-learns: learn_object() adds names to the persistent
@@ -814,35 +820,33 @@ class OpencvFuncs():
         # Prefer YOLOv8 when available — 80 COCO classes, much better accuracy
         if self.yolo_model is not None:
             try:
-                results = self.yolo_model(img, verbose=False, conf=0.25)
+                hits = self.yolo_model.detect(img, conf=0.25)
                 objects = []
                 confidences = []
                 boxes = []
-                for r in results:
-                    for box in r.boxes:
-                        cls_id = int(box.cls[0])
-                        conf = float(box.conf[0])
-                        name = self.yolo_model.names.get(cls_id, f"class_{cls_id}")
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                for hit in hits:
+                    name = hit['name']
+                    conf = hit['conf']
+                    x1, y1, x2, y2 = hit['box']
 
-                        # Color code: green for people, cyan for vehicles, yellow for animals, white for others
-                        if name == 'person':
-                            color = (0, 200, 0)
-                        elif name in ('car', 'truck', 'bus', 'motorcycle', 'bicycle'):
-                            color = (255, 200, 0)
-                        elif name in ('dog', 'cat', 'bird', 'horse', 'sheep', 'cow', 'bear'):
-                            color = (0, 255, 255)
-                        else:
-                            color = (200, 200, 200)
+                    # Color code: green for people, cyan for vehicles, yellow for animals, white for others
+                    if name == 'person':
+                        color = (0, 200, 0)
+                    elif name in ('car', 'truck', 'bus', 'motorcycle', 'bicycle'):
+                        color = (255, 200, 0)
+                    elif name in ('dog', 'cat', 'bird', 'horse', 'sheep', 'cow', 'bear'):
+                        color = (0, 255, 255)
+                    else:
+                        color = (200, 200, 200)
 
-                        cv2.rectangle(overlay_buffer, (x1, y1), (x2, y2), color, 2)
-                        label = f"{name} {conf:.0%}"
-                        y = y1 - 10 if y1 - 10 > 15 else y1 + 15
-                        cv2.putText(overlay_buffer, label, (x1, y),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                        objects.append(name)
-                        confidences.append(conf)
-                        boxes.append((x1, y1, x2, y2))
+                    cv2.rectangle(overlay_buffer, (x1, y1), (x2, y2), color, 2)
+                    label = f"{name} {conf:.0%}"
+                    y = y1 - 10 if y1 - 10 > 15 else y1 + 15
+                    cv2.putText(overlay_buffer, label, (x1, y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    objects.append(name)
+                    confidences.append(conf)
+                    boxes.append((x1, y1, x2, y2))
 
                 # Store latest detections for Lance voice queries
                 self.last_detections = [
@@ -864,7 +868,7 @@ class OpencvFuncs():
                 self.overlay = overlay_buffer
                 return objects, confidences, boxes
             except Exception as e:
-                logging.warning("YOLOv8 detection failed, falling back: %s", e)
+                logging.warning("object detection failed, falling back: %s", e)
 
         # Fallback: old MobileNet Caffe model
         cv2.putText(overlay_buffer, 'Person Detect', (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
@@ -1852,17 +1856,11 @@ class OpencvFuncs():
             except Exception as e:
                 logging.error("world detect error, falling back: %s", e)
 
-        # Run YOLOv8 COCO detection if available (closed-set fallback)
+        # Run the closed-set detector if available (closed-set fallback)
         if self.yolo_model is not None:
             try:
-                results = self.yolo_model(frame, verbose=False, conf=0.3)
-                found = []
-                for r in results:
-                    for box in r.boxes:
-                        cls_id = int(box.cls[0])
-                        conf = float(box.conf[0])
-                        name = self.yolo_model.names.get(cls_id, f"class_{cls_id}")
-                        found.append((name, conf, list(map(int, box.xyxy[0]))))
+                found = [(h['name'], h['conf'], list(h['box']))
+                         for h in self.yolo_model.detect(frame, conf=0.3)]
 
                 # Also store for later reference (names canonicalized)
                 self.last_detections = [

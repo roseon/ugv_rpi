@@ -30,7 +30,8 @@ set -u
 
 ROBOT_HOST="${ROBOT_HOST:-ws@192.168.24.25}"
 REMOTE_DIR="${REMOTE_DIR:-/home/ws/ugv_rpi}"
-WEIGHTS="${WEIGHTS:-yolov8n.pt}"      # eyes_gaze's default detector, also cv_ctrl's
+WEIGHTS="${WEIGHTS:-}"                # the detector's model file; derived below from detector.py
+SOURCE_WEIGHTS="${SOURCE_WEIGHTS:-}"  # the weights it is built from, also from detector.py
 CORPUS="${CORPUS:-minionese_corpus.txt}"  # minionese.py trains its language from this
 ENGLISH="${ENGLISH:-minionese_english.txt}"  # the English side of the meanings it teaches in French
 # Fail in seconds on a wrong or sleeping host rather than hanging on a TCP SYN.
@@ -53,6 +54,22 @@ for arg in "$@"; do
 done
 
 command -v "$PY" >/dev/null 2>&1 || { echo "'$PY' not found; set PYTHON=/path/to/python" >&2; exit 1; }
+
+# ── the detector's model file, from the module that names it ─────────────────
+# Not a second copy of the name: detector.py owns which model runs on the robot,
+# and a hand-written copy here is exactly how the app and the eyes could drift on
+# to two different models without anything failing.  So ask it.  A model file is
+# a blob, not a module, so no import graph will ever find it for us.
+if [ -z "$WEIGHTS" ]; then
+  MODEL_NAMES="$("$PY" -c 'import sys; sys.path.insert(0, sys.argv[1]); import detector; print(detector.MODEL_FILE, detector.SOURCE_WEIGHTS)' "$HERE" 2>/dev/null || true)"
+  if [ -n "$MODEL_NAMES" ]; then
+    WEIGHTS="${MODEL_NAMES% *}"
+    SOURCE_WEIGHTS="${SOURCE_WEIGHTS:-${MODEL_NAMES#* }}"
+  else
+    echo "[deploy] could not ask detector.py which model to ship (it imports cv2);" >&2
+    echo "[deploy] set WEIGHTS=<file> to ship one, or the robot keeps the model it has" >&2
+  fi
+fi
 
 # ── the module set, derived from what app.py actually imports ────────────────
 FILES="$("$PY" - "$HERE" <<'PY'
@@ -146,9 +163,9 @@ PY_LIST="$(printf '%s\n' "$FILES" | grep -E '\.py$' | tr '\n' ' ')"
 if [ "$MODE" = "manifest" ]; then
   echo "# $COUNT local modules app.py reaches (transitively), from $HERE"
   printf '%s\n' "$FILES"
-  # Weights and the corpus are files, not modules, so this list cannot show them.
-  if [ -f "$WEIGHTS" ]; then echo "# weights: $WEIGHTS would ship too"
-  else echo "# weights: no $WEIGHTS here - the robot must have its own, or nobody is detected"; fi
+  # The model file and the corpus are files, not modules, so this list cannot show them.
+  if [ -f "$WEIGHTS" ]; then echo "# model: $WEIGHTS would ship too"
+  else echo "# model: no $WEIGHTS here - the robot must have its own, or nobody is detected"; fi
   if [ -f "$CORPUS" ]; then echo "# corpus: $CORPUS would ship too"
   else echo "# corpus: no $CORPUS here - the robot would speak plain English"; fi
   if [ -f "$ENGLISH" ]; then echo "# english side: $ENGLISH would ship too"
@@ -182,12 +199,33 @@ printf '%s\n' "$FILES" | ssh "${SSH_OPTS[@]}" "$ROBOT_HOST" "
 tar czf - $FILES | ssh "${SSH_OPTS[@]}" "$ROBOT_HOST" "cd '$REMOTE_DIR' && tar xzf - && echo '[deploy] files extracted'" \
   || { echo "[deploy] transfer failed" >&2; exit 1; }
 
-# ── the detector's weights ───────────────────────────────────────────────────
+# ── the detector's model file ────────────────────────────────────────────────
 # A blob, not a module: its own tar, never passed to py_compile.  Absent locally
 # it is simply not shipped, and the far-side check below says so out loud.
 if [ -f "$WEIGHTS" ]; then
-  tar czf - "$WEIGHTS" | ssh "${SSH_OPTS[@]}" "$ROBOT_HOST" "cd '$REMOTE_DIR' && tar xzf - && echo '[deploy] weights shipped: $WEIGHTS'" \
-    || { echo "[deploy] weights transfer failed" >&2; exit 1; }
+  tar czf - "$WEIGHTS" | ssh "${SSH_OPTS[@]}" "$ROBOT_HOST" "cd '$REMOTE_DIR' && tar xzf - && echo '[deploy] model shipped: $WEIGHTS'" \
+    || { echo "[deploy] model transfer failed" >&2; exit 1; }
+fi
+
+# ── and a robot that has none can still be given one ───────────────────────────
+# The model file is a deployed artifact, not a committed one: it is tens of MB of
+# weights derived from the source weights, and this repo keeps its weights on the
+# robot rather than in git.  A fresh clone therefore has nothing to ship, and used
+# to be left with a robot that detects nothing - so build it here instead, from the
+# weights, with the export detector.py's header documents.  Only when it is absent.
+#
+# YOLO_AUTOINSTALL=false is load-bearing, not tidiness: ultralytics' exporter pip
+# installs its own onnxruntime/onnxslim, and the numpy wheel it pulls is 2.x - which
+# this OpenCV build cannot import.  Without this it leaves the robot unable to
+# `import cv2` in any new process, i.e. unable to start the app at all.
+if [ "$MODE" = "deploy" ] && [ ! -f "$WEIGHTS" ] && [ -n "$WEIGHTS" ] && [ -n "$SOURCE_WEIGHTS" ]; then
+  ssh "${SSH_OPTS[@]}" "$ROBOT_HOST" "cd '$REMOTE_DIR' && \
+    if [ -f '$WEIGHTS' ]; then echo '[deploy] the robot already has $WEIGHTS'; else \
+      echo '[deploy] the robot has no $WEIGHTS - building it from $SOURCE_WEIGHTS (about a minute)'; \
+      YOLO_AUTOINSTALL=false ./ugv-env/bin/python -c \"from ultralytics import YOLO; YOLO('$SOURCE_WEIGHTS').export(format='onnx', imgsz=640, dynamic=False, opset=12)\" \
+        && echo '[deploy] model built: $WEIGHTS' \
+        || { echo '[deploy] model build FAILED - this robot has no detector' >&2; exit 1; }; \
+    fi" || { echo "[deploy] the model step failed" >&2; exit 1; }
 fi
 
 # ── the Minionese corpus, and its English side ──────────────────────────────
@@ -218,11 +256,7 @@ printf '%s\n' "$FILES" | ssh "${SSH_OPTS[@]}" "$ROBOT_HOST" "
   \$P -c 'import eyes_gaze; print(\"[check] gaze module importable:\", eyes_gaze.__file__)'
   \$P -c 'import minionese; L = minionese.LANGUAGE; print(\"[check] minionese trained:\", (len(L.table), len(L.vocab)) if L else \"NO CORPUS (\\\"$CORPUS\\\" missing) - it would speak plain English\")'
   \$P -c 'import minionese as m; L = m.LANGUAGE; b = lambda s: s.strip(\".,!?\").lower(); c = {b(x) for x, _ in L.entries}; e = {b(x) for x, _ in L.english}; print(\"[check] english side covers:\", len(c & e), \"of\", len(c), \"meanings\", \"MISSING \" + str(sorted(c - e)[:3]) if c - e else \"\")'
-  if [ -f '$WEIGHTS' ]; then
-    echo '[check] gaze weights present: $WEIGHTS'
-  else
-    echo '[check] gaze weights MISSING: no person can be detected - put $WEIGHTS in $REMOTE_DIR'
-  fi
+  \$P -c 'import os, detector; p = detector.resolve(detector.MODEL_FILE); print(\"[check] detector model\", p, \"present\" if os.path.exists(p) else \"MISSING - nobody can be detected\")'
   if [ \$missing -ne 0 ]; then exit 1; fi
 " || { echo "[deploy] the far side is missing modules or cannot import the gaze - not restarting" >&2; exit 1; }
 

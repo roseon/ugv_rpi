@@ -213,7 +213,7 @@ class EyeGazer:
                  prox_mm=DEFAULT_PROX_MM, close_mm=DEFAULT_CLOSE_MM,
                  hz=10.0, cam_hz=2.0, hold_s=0.5, conf=0.30,
                  screen_fov_deg=DEFAULT_SCREEN_FOV_DEG,
-                 model="yolov8n.pt",
+                 model=None,
                  link=None, detector=None, on_hits=None, clock=time.time):
         self.base = base
         self.cvf = cvf
@@ -308,30 +308,28 @@ class EyeGazer:
     # ── setup helpers ────────────────────────────────────────────────────────
     @staticmethod
     def _resolve_model(name, root):
-        """Find the weights in cwd, or next to this file (the repo root)."""
-        if not name:
-            return None
-        if os.path.isabs(name) or os.path.exists(name):
-            return name
-        here = root or os.path.dirname(os.path.abspath(__file__))
-        candidate = os.path.join(here, name)
-        return candidate if os.path.exists(candidate) else name
+        """The weights to run — named by detector.py, found by it too, so the
+        gaze cannot end up following a different model from the app's."""
+        import detector
+        return detector.resolve(name or detector.MODEL_FILE, root)
 
     def _model_instance(self):
-        """Load YOLOv8n once, lazily — never at import or in the app's boot path.
+        """Load the detector once, lazily — never at import or in the app's boot path.
 
+        ``detector.py`` owns which model this is; all the gaze owns is having one.
         If this load fails the eyes cannot see a person at all, so it must not be
-        the end of the feature: ``cv_ctrl`` loads *the same weights* at boot and
-        keeps the model (``yolo_model``).  A second load can fail where that one
-        succeeded — no internet for ultralytics' first-run download, a second
-        instance, a version skew — and every previous failure here ended as a
-        single printed line and a gaze that silently followed LIDAR forever.
+        the end of the feature: ``cv_ctrl`` loads the same module at boot and keeps
+        it (``yolo_model``).  A second load can fail where that one succeeded — a
+        second instance, a path that differs from the app's working directory, a
+        model file that was never deployed — and every previous failure here ended
+        as a single printed line and a gaze that silently followed LIDAR forever.
         """
         if self._model is not None or self._model_failed:
             return self._model
         try:
-            from ultralytics import YOLO
-            self._model = YOLO(self.model_path)
+            import detector
+            self._model = detector.Detector(self.model_path)
+            self._model.load()
         except Exception as e:                                  # noqa: BLE001
             self._model_failed = True
             self._model_error = str(e)
@@ -352,14 +350,7 @@ class EyeGazer:
         model = self._model_instance()
         if model is None:
             return []
-        hits = []
-        for r in model(frame, verbose=False, conf=self.conf):
-            for box in r.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                name = getattr(model, "names", {}).get(int(box.cls[0]), "object")
-                hits.append({"name": name, "conf": float(box.conf[0]),
-                             "box": (x1, y1, x2, y2)})
-        return hits
+        return model.detect(frame, conf=self.conf)
 
     @staticmethod
     def _frame_signature(frame):

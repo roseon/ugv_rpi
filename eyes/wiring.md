@@ -185,7 +185,7 @@ The three ways to see nothing move, in the order worth checking:
 | status says | what it means |
 |---|---|
 | `sent: 0`, no `port` | the gaze never opened the Uno — `serial_ports.uno_port()` did not find it (`ls /dev/serial/by-id/`) |
-| `camera: null`, `camera_persons: 0`, `reason: idle` | the person was not detected: no frame yet, or `[eyes] object model unavailable` in the app log (run the app from `~/ugv_rpi`, where `yolov8n.pt` lives) |
+| `camera: null`, `camera_persons: 0`, `reason: idle` | the person was not detected: no frame yet, or `[eyes] object model unavailable` in the app log (run the app from `~/ugv_rpi`, where the detector's model file lives — `detector.py` names it, and `bash deploy.sh` reports whether the robot has it) |
 | `connected: false` | nothing is running the gaze at all — check the app is this version: `grep -c eyes_gaze ~/ugv_rpi/app.py` must not be `0` |
 
 `eyes/pi_eyes.py` is now a **read-only** status tool for that same link — it opens neither the Uno nor the camera, so running it cannot fight the app for either device:

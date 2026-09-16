@@ -724,6 +724,49 @@ at any weight that made it matter it outranked the straight-ahead preference and
 took the robot off the proven straight line in an open room, which is exploration
 nobody asked for.  `explore_score()` went with it rather than sitting unused.
 
+## The object detector is now `yolov8s` through OpenCV's DNN, and one module names it
+
+**The model name lived in three places** — `cv_ctrl` loaded `yolov8n.pt`,
+`eyes_gaze` defaulted to the same string, and `deploy.sh` carried a third copy to
+decide what to ship — so the app and the eyes could drift on to two different
+detectors with nothing failing.  `detector.py` is now the single owner, and
+`deploy.sh` asks it rather than repeating the string; the measurements behind the
+choice and the export line live in that module's header.
+
+**Why the runtime moved rather than just the model.**  Torch costs the same on one
+thread as on four on this CPU, while OpenCV's DNN — a dependency the app already
+had — runs the same weights about three times faster.  That is what pays for a
+bigger model: under the app's own load, `yolov8s` through the DNN takes **1337 ms**
+per camera pass against the **986 ms** the old `yolov8n` took through torch (the
+same `yolov8s` in torch would have cost 2282 ms).  Everything above `yolov8s`
+pushes the pass past two seconds and the eyes' following is bounded by that rate,
+so `yolov8x` — the most accurate, 10253 ms — was measured and rejected rather than
+shipped.  Want the eyes more responsive instead of more accurate?  It is one
+constant: export a smaller model the same way, name it in
+`detector.MODEL_FILE`, and the pass drops to a measured 574 ms — inside the
+gaze's declared 2 Hz (500 ms/frame) budget, which no torch model could meet.
+
+**Boxes agree with the trained model.**  Over three live frames from the robot's
+own camera, the new decode landed within 0–3 px of the same weights in ultralytics,
+same classes — and it found two people where the old `yolov8n` found one at 0.32.
+`detector_selftest.py` (17 checks) pins what the module owns without the weights:
+the letterbox geometry, the decode back to frame pixels, per-class NMS, the
+vocabulary `object_speech` builds its spoken table from, and that no module outside
+the owner names a detector model again.
+
+**The model file is deployed, not committed.**  It is 44 MB of weights derived from
+`yolov8s.pt`, and every other weight in this repo lives on the robot rather than in
+git (`.gitignore`), so this one does too: `deploy.sh` ships the exact bytes when the
+tree has them, and when the robot has none it builds them there from the weights
+with the export `detector.py`'s header carries.  That build runs under
+`YOLO_AUTOINSTALL=false`, and it has to: ultralytics' exporter installs its own
+`onnxruntime`/`onnxslim`, and the numpy wheel it pulled was 2.x, which this OpenCV
+build cannot import — it left the robot unable to `import cv2` in any new process
+until the stray `numpy/` was removed from the venv.  A model built this way is the
+same detector but not the same bytes (the simplifier never runs): over one frame its
+raw output was bit-identical to the shipped file (max absolute difference
+0.000e+00), with the same box and confidence to six decimals.
+
 **Volume.**  `set_audio_volume()` was pygame's music mixer, and the robot's speech
 never goes through it — it is played by `paplay` to the Bluetooth sink, which sat
 at 83% whatever the app asked for.  `voice.py` now owns the output level

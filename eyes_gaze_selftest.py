@@ -258,52 +258,35 @@ check("the largest detection wins", g.status(1.0)["camera"] == "person",
       f"got {g.status(1.0)['camera']}")
 
 
-# The real detector path - no injected detector - had never been run: it parses
-# ultralytics' result objects.  A stand-in with the same shape pins that parsing
-# without needing the weights (yolov8n.pt is not in the repo).
-class _Tensor1D:
-    def __init__(self, values):
-        self.values = values
-
-    def __getitem__(self, i):
-        return self.values[i]
-
-    def tolist(self):
-        return list(self.values)
-
-
-class _Box:
-    def __init__(self, xyxy, cls, conf):
-        self.xyxy = [_Tensor1D(xyxy)]
-        self.cls = _Tensor1D([cls])
-        self.conf = _Tensor1D([conf])
-
-
-class _Result:
-    def __init__(self, boxes):
-        self.boxes = boxes
-
-
-class _FakeYolo:
-    """Stands in for an ultralytics YOLO: model(frame) -> [result]."""
+# The model path no injected detector takes - the gaze loading detector.py's own
+# Detector and consuming what it hands back - had never been run against that
+# module's hit shape.  A stand-in of the same shape pins the hand-off without the
+# weights (the .onnx is not in the repo; the numbers themselves are covered by
+# detector_selftest.py).
+class _FakeDetector:
+    """Stands in for detector.Detector: load(), then detect(frame)."""
 
     names = {0: "person", 56: "chair"}
 
-    def __init__(self, boxes):
-        self._boxes = boxes
+    def __init__(self, hits):
+        self._hits = hits
 
-    def __call__(self, *_a, **_kw):
-        return [_Result(self._boxes)]
+    def load(self):
+        return self
+
+    def detect(self, *_a, **_kw):
+        return [dict(h) for h in self._hits]
 
 
 link = FakeLink()
 g = make_gazer(link, frame=FakeFrame(640, 480), cam_hz=2.0)
-g._model = _FakeYolo([_Box((40, 60, 300, 460), 56, 0.77),      # big chair, left
-                      _Box((400, 90, 560, 470), 0, 0.91)])     # person, right
+g._model = _FakeDetector([
+    {"name": "chair", "conf": 0.77, "box": (40, 60, 300, 460)},     # big chair, left
+    {"name": "person", "conf": 0.91, "box": (400, 90, 560, 470)}])  # person, right
 st = g.step(now=1.0)
-check("the real detector path parses ultralytics boxes", st["camera"] == "person",
+check("the detector's hits reach the gaze", st["camera"] == "person",
       f"got {st['camera']}")
-check("the parsed confidence reaches status without error", st["camera_persons"] == 1,
+check("the person count reaches status without error", st["camera_persons"] == 1,
       f"got {st['camera_persons']}")
 
 # The bug this answers: the largest box in a room is often furniture, so the eyes
@@ -703,24 +686,25 @@ st = g.step(now=16.0)                # now the pixels stop changing too
 check("a picture that genuinely stops changing is read as stale",
       st["reason"] != "camera", f"got {st['reason']}")
 
-# The failure this answers: the eyes load their own YOLO, and when that load
-# fails the gaze silently follows LIDAR forever.  cv_ctrl loads the same weights
-# at boot, so the eyes borrow that model instead of losing the feature.
-import sys as _sys
+# The failure this answers: the eyes load their own detector, and when that load
+# fails the gaze silently follows LIDAR forever.  cv_ctrl loads the same module at
+# boot, so the eyes borrow that detector instead of losing the feature.
+import detector as _detector
 
 
-class _BrokenUltralytics(types.ModuleType):
-    """An ultralytics that cannot load weights (no internet, no file)."""
+class _BrokenDetector:
+    """A detector whose model cannot be opened (never deployed, no file)."""
 
-    def __getattr__(self, name):
+    def __init__(self, *_a, **_kw):
         raise RuntimeError("weights are not on disk and there is no internet")
 
 
-_saved_ultra = _sys.modules.get("ultralytics")
-_sys.modules["ultralytics"] = _BrokenUltralytics("ultralytics")
+_saved_detector_class = _detector.Detector
+_detector.Detector = _BrokenDetector
 try:
     cvf = FakeCvf(FakeFrame(640, 480))
-    cvf.yolo_model = _FakeYolo([_Box((400, 90, 560, 470), 0, 0.91)])   # the app's own
+    cvf.yolo_model = _FakeDetector(
+        [{"name": "person", "conf": 0.91, "box": (400, 90, 560, 470)}])  # the app's own
     link = FakeLink()
     g = EyeGazer(FakeBase((), ()), cvf, link=link, cam_hz=2.0, clock=lambda: 1.0)
     st = g.step(now=1.0)
@@ -740,10 +724,7 @@ try:
           and st["reason"] == "lidar_close" and link.writes[-1] == b"T 50 50\n",
           f"got ready={st['model_ready']} reason={st['reason']} {link.writes}")
 finally:
-    if _saved_ultra is not None:
-        _sys.modules["ultralytics"] = _saved_ultra
-    else:
-        _sys.modules.pop("ultralytics", None)
+    _detector.Detector = _saved_detector_class
 
 # Stopping the gaze has to stop publishing what the camera last saw: a viewer
 # left drawing those boxes over a live stream, with `frame 0.0 s old` beside
