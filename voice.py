@@ -27,6 +27,7 @@ Pi 5 screen and the desktop both animate the syllables actually coming out.
 
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -105,6 +106,47 @@ def play_wav(wav_bytes, timeout):
             os.unlink(path)
         except OSError:
             pass
+
+
+# ── how loud the robot is ─────────────────────────────────────────────────────
+# The *sink*, not a mixer.  Speech is played by paplay (play_wav above), so
+# pygame's own music volume never touched the robot's speech and turning it down
+# did nothing -- measured here, the Bluetooth sink sat at 83% whatever the app
+# asked for.  The level belongs to the output device, and this is the one place
+# that reads and writes it, so the UI's slider and the command line cannot
+# disagree about how loud the robot is.
+def _mixer_out(cmd):
+    """Run one mixer command, returning stdout or None (no tool, no sink)."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def sink_volume():
+    """The output level, 0..100, or None when it cannot be read."""
+    out = _mixer_out(["/usr/bin/pactl", "get-sink-volume", "@DEFAULT_SINK@"])
+    if out is None:
+        out = _mixer_out(["/usr/bin/amixer", "sget", "Master"])
+    match = re.search(r"(\d{1,3})%", out or "")
+    return int(match.group(1)) if match else None
+
+
+def set_sink_volume(percent):
+    """Set the output level, clamped 0..100.  Returns the level now in force.
+
+    The clamp is here rather than at the caller because the sink accepts any
+    number and silently reshapes it (150% on this Pi is louder than 100% by
+    gain, not by clipping), so "what the UI asked for" and "what the robot is"
+    would otherwise drift apart.
+    """
+    percent = max(0, min(100, int(round(float(percent)))))
+    if _mixer_out(["/usr/bin/pactl", "set-sink-volume", "@DEFAULT_SINK@",
+                   "%d%%" % percent]) is None:
+        if _mixer_out(["/usr/bin/amixer", "sset", "Master", "%d%%" % percent]) is None:
+            return None
+    return sink_volume()
 
 
 def _speak_local(spoken):

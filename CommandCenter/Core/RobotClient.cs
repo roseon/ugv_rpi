@@ -144,6 +144,24 @@ public sealed class RobotClient : IAsyncDisposable
         }
     }
 
+    /// <summary>The robot's output level, 0..100, or null when it cannot say.</summary>
+    public async Task<int?> GetVolumeAsync()
+    {
+        try
+        {
+            var j = await GetJsonAsync("/volume");
+            if (j.TryGetProperty("volume", out var v) && v.ValueKind == JsonValueKind.Number)
+                return v.GetInt32();
+        }
+        catch { /* offline, or a robot older than /volume */ }
+        return null;
+    }
+
+    /// <summary>Set the robot's output level; returns the level now in force.</summary>
+    public async Task<int> SetVolumeAsync(int percent) =>
+        (await PostFormAsync("/volume", new() { ["level"] = percent.ToString() }))
+            .GetProperty("volume").GetInt32();
+
     public Task<JsonElement> RetryCameraAsync() => PostFormAsync("/retry_camera", new Dictionary<string, string>());
     public Task<JsonElement> SetAvoidanceAsync(bool on) => PostFormAsync("/lidar_avoidance", new() { ["enable"] = on ? "true" : "false" });
 

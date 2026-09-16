@@ -141,6 +141,52 @@ def arc_clearance(angles_rad, distances_mm, heading_rad, half_width_rad,
     return 1.0 - blocked / float(total)
 
 
+# ── pose: where the robot is, in the frame its map is kept in ────────────────
+# Wheel odometry reports signed travel per wheel in metres (measured on this
+# robot: 2.0 s at 0.30 came back as 0.589 m).  The chassis turns about its
+# centre, so the wheels' difference is a rotation and their mean is a step along
+# the heading.  The pose is kept in the map frame, which is the robot frame at
+# the moment the map was started: x = left, y = forward, theta = heading
+# (counter-clockwise, 0 = +y), matching the angle convention above.
+TRACK_M = 0.20          # wheel track (left-right): the one dimension the wheel
+                        # odometry cannot supply.  The UGV Rover body is 230 mm
+                        # wide with the wheels outboard of it.
+POSE_MAX_STEP_M = 1.5   # a step bigger than this is not a wheel measurement
+
+
+def pose_step(pose, d_left_m, d_right_m, track_m=TRACK_M):
+    """Move `pose` (x, y, theta) by one odometry step.  Returns the new pose."""
+    x, y, theta = pose
+    d_left_m = float(d_left_m or 0.0)
+    d_right_m = float(d_right_m or 0.0)
+    turn = (d_right_m - d_left_m) / max(1e-6, track_m)   # right wheel further = left turn
+    step = 0.5 * (d_left_m + d_right_m)
+    mid = theta + turn / 2.0                             # integrate on the mid-step heading
+    return (x + step * math.sin(mid), y + step * math.cos(mid),
+            normalize_angle(theta + turn))
+
+
+def robot_to_world(pose, mx, my):
+    """A point in the robot frame (x left, y forward, metres) -> map frame."""
+    x, y, theta = pose
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    return (x + mx * cos_t + my * sin_t, y - mx * sin_t + my * cos_t)
+
+
+def world_to_robot(pose, wx, wy):
+    """The inverse of robot_to_world (used by every map query)."""
+    x, y, theta = pose
+    dx, dy = wx - x, wy - y
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    return (dx * cos_t - dy * sin_t, dx * sin_t + dy * cos_t)
+
+
+def point_from_scan(a, d_mm):
+    """One LIDAR reading (robot-frame angle, mm) -> robot-frame point in metres."""
+    d = d_mm / 1000.0
+    return (d * math.sin(a), d * math.cos(a))
+
+
 def front_min_mm(angles_rad, distances_mm, half_deg):
     """Smallest positive range inside a forward cone, in mm (None if none)."""
     return min((d for a, d in zip(angles_rad, distances_mm)

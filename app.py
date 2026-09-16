@@ -49,6 +49,7 @@ import numpy as np
 import cv_ctrl
 import audio_ctrl
 import os_info
+import voice
 import self_drive
 import eyes_gaze
 from perception import sector_min as _sector_min, turn_bias as _turn_bias
@@ -1068,12 +1069,19 @@ def selfdrive_status():
 
 @app.route('/surroundings')
 def surroundings():
-    """Learned surroundings for the UI: occupancy cells (robot frame, m) + objects."""
+    """Learned surroundings for the UI: occupancy cells (map frame, m) + objects.
+
+    The cells are places, not bearings: the frame is the robot's own position
+    when the memory was last cleared, and `map.pose` is where the robot is in
+    it, so the same wall keeps one set of cells as the robot drives.
+    """
     return jsonify({
         'cells': [{'x': mx, 'y': my, 'hits': h}
                   for mx, my, h in self_driver.memory.cells(min_hits=1)],
         'objects': self_driver.memory.objects[-50:][::-1],
         'busy_cells': self_driver.memory.busy_cells,
+        'free_cells': self_driver.memory.free_cells,
+        'map': self_driver.memory.pose_status(),
     })
 
 @app.route('/selfdrive_map', methods=['POST'])
@@ -1135,6 +1143,30 @@ def speech_status():
     instead of each guessing at a wobble of their own.
     """
     return jsonify(speech_face.FACE.snapshot())
+
+
+@app.route('/volume', methods=['GET', 'POST'])
+def volume_route():
+    """The robot's output level (0..100) — what the Command Center slider drives.
+
+    GET reads it; POST takes `level` and answers with the level now in force,
+    which is the sink's, not the requested one.
+    """
+    asked = request.form.get('level', request.args.get('level'))
+    if asked is None or asked == '':
+        now = voice.sink_volume()
+        return jsonify({'status': 'ok' if now is not None else 'error',
+                        'volume': now})
+    try:
+        level = int(round(float(asked)))
+    except (TypeError, ValueError):
+        return jsonify({'status': 'error',
+                        'message': f'level {asked!r} is not a number'}), 400
+    now = voice.set_sink_volume(level)
+    if now is None:
+        return jsonify({'status': 'error',
+                        'message': 'no audio sink to set on this robot'}), 503
+    return jsonify({'status': 'success', 'volume': now})
 
 
 @app.route('/api/say', methods=['POST'])

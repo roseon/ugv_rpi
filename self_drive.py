@@ -36,7 +36,7 @@ import time
 
 from detection_source import DetectionSource
 from perception import arc_clearance
-from robot_state import LidarScan, wheel_odometry
+from robot_state import LidarScan, WheelStep, wheel_odometry
 from spatial_memory import MEM_VERSION, SpatialMemory          # re-exported
 from target_pursuit import PursuitPolicy, Target
 
@@ -55,6 +55,25 @@ VETO_HALF_WIDTH = 0.4      # rad — live arc sampled per candidate heading
 W_LIDAR = 2.0
 W_MEM   = 1.2
 W_GOAL  = 0.6
+MEM_RADII = (0.55, 1.1)  # metres — remembered occupancy is sampled near and far
+MEM_BLOCK_CLEAR = 0.34   # below this fraction of a near arc the heading is refused
+
+# ── what the learned map is for ──────────────────────────────────────────────
+# The grid is place-referenced now, which is what makes it worth driving on: a
+# wall or a chair the robot passed a second ago is still remembered *there*
+# when the scan has swung away from it, so a heading into remembered occupancy
+# is scored down — and refused outright when the near arc is solid — and the
+# robot goes around what it already knows about instead of re-finding it.
+#
+# It reads evidence that DECAY_SEC expires, so a chair that has moved stops
+# steering within a few seconds of the scan no longer seeing it.
+#
+# A frontier term ("prefer the nearest unmapped space") was built and then
+# removed: with any weight that made it matter it outranked the straight-ahead
+# goal preference in an open room and took the robot off the proven straight
+# line (the cruise probes below caught it choosing +45° in a clear room), which
+# is exploration — a behaviour nobody asked for — at the cost of one that was
+# proven live.
 
 # ── steering smoothing (what stops the left/right wobble) ─────────────────────
 # HEADINGS is a discrete set and the score gap between neighbours is routinely
@@ -97,27 +116,67 @@ class SelfDriver:
         self._stop_evt = threading.Event()
         self._thread = None
         self._last_save = time.time()
+        self._wheels = WheelStep()   # wheel travel since the last planning tick
 
         self.suggested_turn = 0.0   # -1..1, + = left (avoider convention)
         self.halt = False           # executor hint: stop the wheels now
         self.last_scores = []       # [(deg, score)] for the UI
         self.last_decision = "off"
         self._heading_smooth = 0.0  # EMA of the chosen heading, in degrees
+        self._learned = False       # something new since the last save
+        self._sampler = None        # the thread that keeps the map current
+        self._sampler_stop = threading.Event()
 
     # ── lifecycle (the only way the thread and its flags change) ──────────
     def warm(self):
-        """Boot state: the thread exists but the planner stays idle."""
-        self.start()
-        self.pause(save=False)
+        """Boot state: the planner exists but stays idle, and the map samples.
 
-    def start(self):
+        Started *inactive*: this used to start it active and pause it from the
+        calling thread, so the loop could get one planning tick in before the
+        pause landed and boot would briefly decide a heading nobody asked for.
+        """
+        self.start(active=False)
+        self.pause(save=False)
+        self._start_sampler()
+
+    def start(self, active=True):
         if self._thread and self._thread.is_alive():
             return
         self._stop_evt.clear()
-        self._active = True
+        self._active = active
         self._thread = threading.Thread(target=self._loop, daemon=True,
                                         name="self-drive")
         self._thread.start()
+
+    # ── the map's own sampler ─────────────────────────────────────────────
+    # Learning is deliberately not the planner's job.  ``disable()`` tears the
+    # planner thread down (what the /selfdrive route does when self-drive is
+    # switched off), and the learned map is what the robot knows about the
+    # place, so it has to keep growing while the robot is driven by hand or
+    # sitting still.  Before this, turning self-drive off stopped the memory
+    # dead, and a hand-driven robot taught it nothing.
+    def _start_sampler(self):
+        if self._sampler and self._sampler.is_alive():
+            return
+        self._sampler_stop.clear()
+        self._sampler = threading.Thread(target=self._sample_loop, daemon=True,
+                                         name="self-drive-map")
+        self._sampler.start()
+
+    def _sample_loop(self):
+        interval = 1.0 / LOOP_HZ
+        while not self._sampler_stop.is_set():
+            t0 = time.time()
+            if not self._active:          # the planner tick learns while it runs
+                try:
+                    self._learn_only()
+                except Exception as e:
+                    print(f"[memory] sample error: {e}")
+            if self._learned and time.time() - self._last_save > SAVE_INTERVAL:
+                self.memory.save()
+                self._last_save = time.time()
+                self._learned = False
+            time.sleep(max(0.0, interval - (time.time() - t0)))
 
     def stop(self):
         self._active = False
@@ -182,7 +241,11 @@ class SelfDriver:
         return self.memory.load()
 
     def clear_memory(self):
-        return self.memory.clear()
+        cleared = self.memory.clear()
+        # The pose starts again from the robot's own frame, so the odometer has
+        # to start again from the counters as they are now.
+        self._wheels.reset()
+        return cleared
 
     @property
     def active(self):
@@ -199,9 +262,11 @@ class SelfDriver:
             'wheels': wheel_odometry(self._base),
             'decision': self.last_decision,
             'busy_cells': self.memory.busy_cells,
+            'free_cells': self.memory.free_cells,
             'objects': self.memory.objects[-20:][::-1],
             'scores': self.last_scores,
             'target': self.target.status(),
+            'map': self.memory.pose_status(),
         }
 
     # ── planning ──────────────────────────────────────────────────────────
@@ -214,10 +279,34 @@ class SelfDriver:
                     self._tick()
                 except Exception as e:
                     print(f"[planner] tick error: {e}")
-                if time.time() - self._last_save > SAVE_INTERVAL:
-                    self.memory.save()
-                    self._last_save = time.time()
             time.sleep(max(0.0, interval - (time.time() - t0)))
+
+    def _learn(self, scan):
+        """Fold this scan (and the camera's view of it) into the learned map.
+
+        The wheel travel is read every tick and collected until a *new*
+        revolution is there to check it against; the map only moves its pose
+        when the scan agrees the robot really went there.
+        """
+        self.memory.observe_lidar(scan.angles, scan.distances,
+                                  odom=self._wheels.step(self._base),
+                                  scan_id=scan.stamp)
+        dets = self.detections.for_target(self.target.name)
+        self.memory.observe_detections(dets, self._object_range_m(scan))
+        self._learned = True
+        return dets
+
+    def _learn_only(self):
+        """Idle: keep learning the place from the LIDAR anyway.
+
+        The map is what the robot knows about where it is, so it has to grow
+        from however the robot got there — driven by hand from the UI, or
+        pushed — not only while this planner is the one holding the sticks.
+        Nothing is decided here: no heading, no halt, no wheel suggestion.
+        """
+        scan = LidarScan.read(self._base)
+        if not scan.empty:
+            self._learn(scan)
 
     def _tick(self):
         """One planning step: read, learn, then decide (safety first)."""
@@ -227,9 +316,7 @@ class SelfDriver:
             # nothing needs stopping here — just refuse to suggest a heading.
             self._hold("no lidar data", stop=False)
             return
-        self.memory.observe_lidar(scan.angles, scan.distances)
-        dets = self.detections.for_target(self.target.name)
-        self.memory.observe_detections(dets, self._object_range_m(scan))
+        dets = self._learn(scan)
 
         front = scan.front_min_mm(FRONT_CONE_DEG)
         if front is not None and front < TOO_CLOSE_MM:
@@ -261,25 +348,36 @@ class SelfDriver:
         bearing = target.aim_bearing          # None when not in view
         self.halt = False
 
-        best, best_score, scores = 0.0, float('-inf'), []
-        for heading in HEADINGS:
+        best, best_score = 0.0, float('-inf')
+
+        def score_heading(heading, map_veto):
+            """This heading's score, or None when something in the way refuses it."""
             heading_rad = math.radians(heading)
             lidar_clear = arc_clearance(scan.angles, scan.distances, heading_rad,
                                         VETO_HALF_WIDTH)
-            mem_clear = self.memory.clearance(heading_rad, 1.1)
             if pursuing and lidar_clear < policy.veto_clear:
-                scores.append((heading, None))   # live obstacle in the way
-                continue
+                return None                      # live obstacle in the way
+            near = self.memory.clearance(heading_rad, MEM_RADII[0])
+            if map_veto and near < MEM_BLOCK_CLEAR:
+                return None                      # remembered obstacle in the way
+            mem_clear = min(near, self.memory.clearance(heading_rad, MEM_RADII[1]))
             goal_term = policy.goal_term(heading, bearing)
             if goal_term is None:
                 goal, weight = -abs(heading) / 180.0, W_GOAL  # prefer straight
             else:
                 goal, weight = goal_term
-            score = W_LIDAR * lidar_clear + W_MEM * mem_clear + weight * goal
-            scores.append((heading, round(score, 3)))
-            if score > best_score:
+            return (W_LIDAR * lidar_clear + W_MEM * mem_clear + weight * goal)
+
+        scores = [(h, score_heading(h, True)) for h in HEADINGS]
+        if not pursuing and all(s is None for _, s in scores):
+            # Every heading refused is the remembered map's own mistake — a bad
+            # pose, or a chair that has since moved.  Driving on what the live
+            # scan says beats parking on what the map says.
+            scores = [(h, score_heading(h, False)) for h in HEADINGS]
+        self.last_scores = [(h, None if s is None else round(s, 3)) for h, s in scores]
+        for heading, score in scores:
+            if score is not None and score > best_score:
                 best_score, best = score, float(heading)
-        self.last_scores = scores
 
         if best_score == float('-inf'):
             # Every heading is blocked right now — hold still and let the

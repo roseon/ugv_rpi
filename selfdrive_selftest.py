@@ -43,9 +43,10 @@ def check(name, cond, detail=""):
 
 
 class RL:
-    def __init__(self, angles, dists):
+    def __init__(self, angles, dists, stamp=None):
         self.lidar_angles_show = angles
         self.lidar_distances_show = dists
+        self.lidar_scan_time = stamp   # moves once per revolution, like the real one
 
 
 class Base:
@@ -77,6 +78,18 @@ def scan(front_mm=3000, sectors=None):
         angles.append(raw(d))
         dists.append(sectors.get(d, front_mm))
     return angles, dists
+
+
+def ticking(drv):
+    """Arm a driver for direct _tick() calls, without starting its thread.
+
+    Production has exactly one ticker per planner (its own loop).  The harness
+    is the ticker here, so it must not also let the driver's thread run: two
+    tickers on one planner interleave ticks, and then which heading won last is
+    a matter of timing and every heading assertion goes flaky.
+    """
+    drv._active = True
+    return drv
 
 
 def planner(scan_pair=None, dets=None, world=None, base_data=None, mem=None):
@@ -247,12 +260,16 @@ drv.warm()
 st = drv.status()
 check("keys identical",
       set(st) == {'active', 'suggested_turn', 'front_mm', 'halt', 'wheels',
-                  'decision', 'busy_cells', 'objects', 'scores', 'target'},
+                  'decision', 'busy_cells', 'free_cells', 'objects', 'scores',
+                  'target', 'map'},
       sorted(st))
 check("wheels read from the ESP32 frame", st['wheels'] ==
       {'odl': -10398.7, 'odr': -9916.4, 'voltage': 11.48})
 check("no target -> target is null", st['target'] is None)
-drv.enable()
+check("the map reports its own frame", st['map']['pose'] == [0.0, 0.0, 0.0]
+      and st['map']['motion'] in ('unknown', 'none', 'waiting', 'unchecked',
+                                  'accepted', 'rejected'), st['map'])
+ticking(drv)     # no planner thread: this harness ticks it
 drv.pursue("chair")
 t = drv.status()['target']
 check("target block keys identical",
@@ -262,7 +279,7 @@ drv.stop()
 # ── 4. safety comes first ────────────────────────────────────────────────────
 print("--- 4. safety: no lidar, too close, surrounded ---")
 drv, _ = planner(([], []))
-drv.enable()
+ticking(drv)     # no planner thread: this harness ticks it
 drv._tick()
 check("no lidar -> refuse a heading, no bogus stop",
       drv.suggested_turn == 0.0 and drv.last_decision == "no lidar data"
@@ -270,7 +287,7 @@ check("no lidar -> refuse a heading, no bogus stop",
 drv.stop()
 
 drv, _ = planner(scan(sectors={0: 200}))
-drv.enable()
+ticking(drv)     # no planner thread: this harness ticks it
 drv._tick()
 check("<250mm ahead -> halt + zero turn",
       drv.halt and drv.suggested_turn == 0.0 and "too close" in drv.last_decision,
@@ -278,7 +295,7 @@ check("<250mm ahead -> halt + zero turn",
 drv.stop()
 
 drv, _ = planner(scan(front_mm=500))
-drv.enable()
+ticking(drv)     # no planner thread: this harness ticks it
 drv.pursue("chair")   # the veto only exists while pursuing
 drv._tick()
 check("everything blocked while pursuing -> hold position",
@@ -289,7 +306,7 @@ drv.stop()
 # ── 5. cruise behavior unchanged ─────────────────────────────────────────────
 print("--- 5. plain cruise ---")
 drv, _ = planner()
-drv.enable()
+ticking(drv)     # no planner thread: this harness ticks it
 drv._tick()
 check("clear room, no target -> straight ahead",
       drv.suggested_turn == 0.0 and drv.last_decision.startswith("heading +0°"),
@@ -317,7 +334,7 @@ PINCH_LEFT = scan(sectors={d: 900 for d in range(-18, -15)})
 PINCH_RIGHT = scan(sectors={d: 900 for d in range(15, 18)})
 
 drv, _ = planner()
-drv.enable()
+ticking(drv)     # no planner thread: this harness ticks it
 drv._tick()
 turns, chosen = [], []
 for pair in (PINCH_LEFT, PINCH_RIGHT) * 6:
@@ -384,7 +401,7 @@ check("an unobserved object disk also decays away",
 print("--- 6. pursuit behaviors ---")
 left_det = [{"name": "chair", "confidence": 0.9, "box": [60, 100, 140, 300]}]
 drv, _ = planner(dets=left_det)
-drv.enable()
+ticking(drv)     # no planner thread: this harness ticks it
 drv.pursue("chair")
 drv._tick()
 t = drv.status()['target']
@@ -402,7 +419,7 @@ drv.stop()
 
 right_det = [{"name": "chair", "confidence": 0.9, "box": [440, 100, 520, 300]}]
 drv, _ = planner(dets=right_det)
-drv.enable()
+ticking(drv)     # no planner thread: this harness ticks it
 drv.pursue("chair")
 drv._tick()
 check("right-of-frame object -> aims right", drv.suggested_turn < 0, drv.suggested_turn)
@@ -410,7 +427,7 @@ drv.stop()
 
 near_det = [{"name": "refrigerator", "confidence": 0.66, "box": [280, 100, 315, 300]}]
 drv, _ = planner(dets=near_det)
-drv.enable()
+ticking(drv)     # no planner thread: this harness ticks it
 drv.pursue("refrigerator")
 turns = []
 for _ in range(4):
@@ -424,7 +441,7 @@ drv.stop()
 # bearing for it to be the *object* the lidar sees, not something beside it.
 AT_BEARING = {d: 500 for d in range(11, 31)}
 drv, _ = planner(scan(sectors=AT_BEARING), dets=left_det)
-drv.enable()
+ticking(drv)     # no planner thread: this harness ticks it
 drv.pursue("chair")
 drv._tick()
 check("0.5m object down its own bearing -> arrived + halt",
@@ -440,7 +457,7 @@ drv.stop()
 # the instant the robot is on top of it; re-deciding arrival each tick used to
 # release halt right there and send the robot off again having reached it.
 drv, cv = planner(scan(sectors=AT_BEARING), dets=left_det)
-drv.enable()
+ticking(drv)     # no planner thread: this harness ticks it
 drv.pursue("chair")
 drv._tick()
 cv.last_detections = []                      # object out of view now
@@ -454,7 +471,7 @@ check("object lost from view after arrival -> halt still held, no turn",
 # chase must resume rather than stay frozen for good.
 FAR_OUT = scan(sectors={d: 3000 for d in range(11, 31)})
 drv, _ = planner(scan_pair=FAR_OUT, dets=left_det)
-drv.enable()
+ticking(drv)     # no planner thread: this harness ticks it
 drv.pursue("chair")
 drv._tick()
 check("object seen again beyond arrive_m -> resumes approaching, halt released",
@@ -466,7 +483,7 @@ drv.stop()
 # so the robot declared arrival at the wall's distance and stopped short.
 BESIDE = {d: 500 for d in range(-40, -5)}
 drv, _ = planner(scan(sectors=BESIDE), dets=left_det)
-drv.enable()
+ticking(drv)     # no planner thread: this harness ticks it
 drv.pursue("chair")
 drv._tick()
 t = drv.status()['target']
@@ -478,7 +495,7 @@ drv.stop()
 mem = spatial_memory.SpatialMemory()
 mem.observe_object("chair", 40.0, 1.5, 0.9)          # remembered on the left
 drv, _ = planner(mem=mem)
-drv.enable()
+ticking(drv)     # no planner thread: this harness ticks it
 drv.pursue("chair")
 drv._tick()
 first = drv.suggested_turn
@@ -491,7 +508,7 @@ drv.stop()
 mem2 = spatial_memory.SpatialMemory()
 mem2.observe_object("chair", -40.0, 1.5, 0.9)        # remembered on the right
 drv, _ = planner(mem=mem2)
-drv.enable()
+ticking(drv)     # no planner thread: this harness ticks it
 drv.pursue("chair")
 drv._tick()
 check("sweep direction follows the memory sign", drv.suggested_turn < 0,
@@ -500,7 +517,7 @@ drv.stop()
 
 wall = {d: 900 for d in range(-12, 13)}
 drv, _ = planner(scan(sectors=wall), dets=near_det)
-drv.enable()
+ticking(drv)     # no planner thread: this harness ticks it
 drv.pursue("refrigerator")
 drv._tick()
 check("wall across the bearing -> veto, route around, keep driving",
@@ -514,7 +531,7 @@ print("--- 7. detections: closed-set live stream + open-vocabulary top-up ---")
 coco = [{"name": "person", "confidence": 0.9, "box": [280, 100, 360, 300]}]
 world = [{"name": "refrigerator", "confidence": 0.66, "box": [60, 100, 140, 300]}]
 drv, cv = planner(dets=coco, world=world)
-drv.enable()
+ticking(drv)     # no planner thread: this harness ticks it
 drv._tick()
 check("no target -> no open-vocabulary scan", cv.world_calls == 0, cv.world_calls)
 drv.pursue("refrigerator")
@@ -535,7 +552,7 @@ drv.stop()
 # object fusion still writes the corrected bearing into memory
 mem3 = spatial_memory.SpatialMemory()
 drv, _ = planner(dets=left_det, mem=mem3)
-drv.enable()
+ticking(drv)     # no planner thread: this harness ticks it
 drv._tick()
 check("detections fused into memory with + bearing (left object)",
       mem3.objects and mem3.objects[0]['bearing_deg'] > 0 and
@@ -591,6 +608,160 @@ check("approach/goto aliases all reach target pursuit",
           for a in ("approach", "goto", "go_to", "drive_to")))
 check("pursuing is reachable the way the router calls it",
       lance.ACTIONS["approach"] is lance._approach)
+
+# ── 10. the learned area is a place, and driving follows it ─────────────────
+# The map used to be robot-centric: cells were "1.2 m ahead of me right now",
+# so the same wall landed in different cells on every pass and the memory could
+# say nothing about where the robot had been.  These probes drive the real
+# planner and the real memory through a synthetic room whose walls never move,
+# and ask whether the map agrees.
+print("--- 10. place-referenced map + the learned area steering ---")
+
+ROOM = (-2.5, 2.5, -3.0, 2.0)      # xmin, xmax, ymin, ymax — metres, map frame
+
+
+def cast(pose, angles_rad):
+    """Ranges (mm) from a map-frame pose to the room's walls — a synthetic LIDAR."""
+    x, y, theta = pose
+    xmin, xmax, ymin, ymax = ROOM
+    out = []
+    for a in angles_rad:
+        psi = theta + a
+        dx, dy = math.sin(psi), math.cos(psi)
+        best = None
+        for t in ([(xmax - x) / dx] if abs(dx) > 1e-9 else []) + \
+                 ([(xmin - x) / dx] if abs(dx) > 1e-9 else []) + \
+                 ([(ymax - y) / dy] if abs(dy) > 1e-9 else []) + \
+                 ([(ymin - y) / dy] if abs(dy) > 1e-9 else []):
+            if t <= 1e-9:
+                continue
+            hx, hy = x + t * dx, y + t * dy
+            if xmin - 1e-6 <= hx <= xmax + 1e-6 and ymin - 1e-6 <= hy <= ymax + 1e-6:
+                best = t if best is None else min(best, t)
+        out.append(6000.0 if best is None else best * 1000.0)
+    return out
+
+
+_angles_raw, _ = scan()
+ANG = [perception.robot_angle(a) for a in _angles_raw]
+mem = spatial_memory.SpatialMemory()
+for sid in (1, 2, 3):                       # three revolutions, standing still
+    mem.observe_lidar(ANG, cast((0.0, 0.0, 0.0), ANG), odom=None, scan_id=sid)
+check("a wall 2 m ahead is remembered at the place it is", mem.blocked(0.0, 2.0))
+check("...with the way there known to be open", not mem.blocked(0.0, 1.0))
+
+mem.observe_lidar(ANG, cast((0.0, 1.0, 0.0), ANG), odom=(1.0, 1.0), scan_id=4)
+check("one metre of wheel travel is accepted as motion", mem.motion == 'accepted',
+      mem.motion)
+check("...and the pose followed the wheels", abs(mem.pose[1] - 1.0) < 0.05, mem.pose)
+# blocked() answers in the robot frame, so a wall 2 m away that the robot has now
+# closed to 1 m must read 1 m ahead -- and nothing at all 2 m ahead, which is
+# where a map that never moved its frame would still be carrying the old sighting.
+check("the wall is 1 m ahead of the robot, not 2", mem.blocked(0.0, 1.0))
+check("the drive did not leave a second wall behind the first",
+      not mem.blocked(0.0, 2.0))
+
+# Turn left 90 degrees on the spot: the wheels report equal and opposite travel,
+# so the frame rotates without the robot going anywhere.
+turn = math.pi / 2 * perception.TRACK_M / 2.0
+mem.observe_lidar(ANG, cast((0.0, 1.0, math.pi / 2), ANG),
+                  odom=(-turn, turn), scan_id=5)
+check("an in-place 90 deg turn is accepted", mem.motion == 'accepted', mem.motion)
+check("the turn moved the pose, not the room", abs(mem.pose[2] - math.pi / 2) < 0.12
+      and abs(mem.pose[1] - 1.0) < 0.05, mem.pose)
+mem.observe_lidar(ANG, cast((0.0, 1.0, math.pi / 2), ANG), odom=(0.0, 0.0),
+                  scan_id=6)
+# Facing +x now: the far side wall is straight ahead (1.5 m), and the wall the
+# robot started facing is off to its right, at -1.0 in a frame where +x is left.
+check("the side wall is now straight ahead, at its own place",
+      mem.blocked(0.0, 2.5), mem.pose)
+check("the wall the robot first faced is remembered off to the right, not ahead",
+      mem.blocked(-1.0, 0.0) and not mem.blocked(0.0, 2.0))
+
+before = mem.pose
+mem.observe_lidar(ANG, cast((0.0, 1.0, math.pi / 2), ANG), odom=(0.5, 0.5), scan_id=7)
+check("wheels claiming motion the scan denies are rejected", mem.motion == 'rejected',
+      mem.motion)
+check("...and the pose stayed where the room puts it", mem.pose == before)
+
+# one revolution is counted once, however fast the planner ticks
+mem9 = spatial_memory.SpatialMemory()
+mem9.observe_lidar(ANG, cast((0.0, 0.0, 0.0), ANG), odom=None, scan_id=11)
+once = mem9.busy_cells
+mem9.observe_lidar(ANG, cast((0.0, 0.0, 0.0), ANG), odom=None, scan_id=11)
+check("a scan already folded in is not counted again", mem9.busy_cells == once,
+      "%d -> %d" % (once, mem9.busy_cells))
+
+# the map steers: a remembered wall refuses the heading into it, and a map that
+# refuses everything falls back to what the live scan says
+mem5 = spatial_memory.SpatialMemory()
+for i in range(-7, 8):
+    for j in range(6, 17):
+        c = mem5._cell(i * 0.05, j * 0.05)        # a solid block 0.3-0.8 m ahead
+        mem5._hits[c[0]][c[1]] = spatial_memory.HIT_MAX
+drv, _ = planner(mem=mem5)
+ticking(drv)     # no planner thread: this harness ticks it
+drv._tick()
+check("a remembered obstacle refuses the heading into it and turns instead",
+      dict(drv.last_scores)[0] is None and not drv.halt
+      and drv.suggested_turn != 0.0, drv.last_decision)
+drv.stop()
+
+mem6 = spatial_memory.SpatialMemory()
+for cx in range(spatial_memory.GRID_SIZE):
+    for cy in range(spatial_memory.GRID_SIZE):
+        mem6._hits[cx][cy] = spatial_memory.HIT_MAX
+drv, _ = planner(mem=mem6)
+ticking(drv)     # no planner thread: this harness ticks it
+drv._tick()
+check("a map that refuses every heading does not park the robot",
+      not drv.halt and "surrounded" not in drv.last_decision, drv.last_decision)
+drv.stop()
+
+# the planner is what feeds the wheels into the map (its odometry is in metres)
+drv9 = SelfDriver(Base(RL(ANG, cast((0.0, 0.0, 0.0), ANG), 21.0),
+                       {'odl': 0.0, 'odr': 0.0}), CV())
+ticking(drv9)     # no planner thread: this harness ticks it
+drv9._tick()                                   # establishes the odometer's origin
+check("no travel yet -> the map has not been told to move",
+      drv9.memory.pose == (0.0, 0.0, 0.0), drv9.memory.pose_status())
+drv9._base.rl = RL(ANG, cast((0.0, 1.0, 0.0), ANG), 22.0)
+drv9._base.base_data = {'odl': 1.0, 'odr': 1.0}
+drv9._tick()
+check("the planner hands the wheel travel and the scan stamp to the map",
+      drv9.memory.motion == 'accepted' and abs(drv9.memory.pose[1] - 1.0) < 0.05,
+      drv9.memory.pose_status())
+check("and reports where it thinks it is", drv9.status()['map']['motion'] == 'accepted'
+      and drv9.status()['map']['pose'][1] > 0.9, drv9.status()['map'])
+drv9.stop()
+
+# ...and it learns whether or not this planner is the one driving
+drv10 = SelfDriver(Base(RL(ANG, cast((0.0, 0.0, 0.0), ANG), 31.0),
+                        {'odl': 0.0, 'odr': 0.0}), CV())
+empty_cells = drv10.memory.busy_cells
+drv10._learn_only()                            # planner paused, robot driven by hand
+check("a paused planner still learns the place it is in",
+      drv10.memory.busy_cells > empty_cells,
+      "%d -> %d" % (empty_cells, drv10.memory.busy_cells))
+check("...and suggests nothing while doing it",
+      drv10.suggested_turn == 0.0 and not drv10.halt)
+
+# ...and it does that on its own thread, because /selfdrive switching self-drive
+# off tears the planner thread down: the map must not stop learning then.
+drv11 = SelfDriver(Base(RL(ANG, cast((0.0, 0.0, 0.0), ANG), 41.0),
+                        {'odl': 0.0, 'odr': 0.0}), CV())
+drv11.warm()                                   # boot: planner idle, map sampling
+time.sleep(0.6)
+check("the map learns at boot with self-drive off", drv11.memory.busy_cells > 0,
+      drv11.memory.busy_cells)
+drv11.disable()                                # what the /selfdrive route does
+check("self-drive off still tears the planner down", drv11._thread is None
+      and drv11._sampler is not None and drv11._sampler.is_alive())
+drv11._base.rl = RL(ANG, cast((0.0, 1.0, 0.0), ANG), 42.0)
+drv11._base.base_data = {'odl': 1.0, 'odr': 1.0}   # driven by hand, off self-drive
+time.sleep(0.8)
+check("...and it follows the robot while a person drives it",
+      drv11.memory.pose[1] > 0.9, drv11.memory.pose_status())
 
 print()
 print("RESULT: %d failures" % len(FAILS))

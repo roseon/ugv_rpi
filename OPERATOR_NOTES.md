@@ -670,3 +670,66 @@ repeats the SSML **with the old `+28%` and with the subscription key hardcoded**
 Nothing imports it; it should go, and that key was in the repo long enough to be
 worth rotating.
 
+### The learned map is a place the robot keeps, and the volume has one owner (Sep 16)
+
+The user's two asks: "lidar mapping — the area for learning the robot can keep
+into memory; when it drives it will follow the mapping of the area", and "add
+volume control on command center — it keeps blasting loud".
+
+**The map was already place-referenced on paper and robot-centric in practice.**
+`spatial_memory.py` had been rebuilt around a map frame, but nothing ever handed
+it the wheel motion: the planner called `observe_lidar(angles, distances)` with no
+odometry and no scan identity, so the pose sat at `(0, 0, 0)` for the life of the
+process and every scan landed in the robot's instantaneous frame — the same wall
+in different cells on every pass.  Now `robot_state.LidarScan` carries the
+revolution's own timestamp, `self_drive` hands `WheelStep.step()` and that stamp
+to the map on every tick, and the map moves the pose only when the scan agrees the
+robot really went there.
+
+Measured on the robot, driving it from the UI with self-drive off:
+
+| | pose | map |
+|---|---|---|
+| standing | `(0.00, 0.00, 0.00)` | 235 busy, 646 free cells |
+| 2.4 s backwards | `(-0.04, 0.65, -0.16)` | 687 busy — it learned the ground it covered |
+| 2.4 s spin | held at `(-0.04, 0.65, -0.16)`, `motion: rejected` | the wheels turned, the scan denied it |
+
+So both branches of the guard are visible live: real motion is accepted and
+carries the frame, claimed motion the scan refuses is rejected and the map stays.
+Asked at the current pose, **17 of 17 sampled bearings have the obstacle the
+LIDAR sees right now remembered at the observed range** (0 missing) — the
+coherence a robot-centric grid cannot have.  The saved `surroundings.json`
+(version 3) now carries the pose with the grid, so the place survives a restart.
+
+**Learning was the planner's child, which was the real bug.**  `disable()` tears
+the planner thread down — that is what `/selfdrive` does when self-drive is
+turned off — so the map stopped learning exactly when a person was driving by
+hand, and started again only while self-drive ran.  A second, tiny sampler thread
+(`SelfDriver._sample_loop`, started at `warm()` with the boot) keeps folding scans
+into the map whenever the planner is idle, decides nothing, and owns the periodic
+save.  The planner's own thread, its `stop()` contract and the `/selfdrive_status`
+payload are unchanged apart from two added fields (`free_cells`, and `map` with
+pose/motion).
+
+**The map steers.**  A heading into remembered occupancy is now scored down at two
+radii (0.55 m and 1.1 m) and refused outright when the near arc is solid — live,
+with self-drive on and 1.36 m of clear floor ahead, the planner refused headings
+`0, -15, -30, -110` on remembered occupancy alone (the live-scan veto only applies
+while pursuing) and still chose `+80°`, so it went around instead of parking.  A
+map that refuses *every* heading falls back to the live scan rather than holding
+forever, because a bad pose must not freeze the robot.
+
+A frontier term ("prefer the nearest unmapped space") was built and then deleted:
+at any weight that made it matter it outranked the straight-ahead preference and
+took the robot off the proven straight line in an open room, which is exploration
+nobody asked for.  `explore_score()` went with it rather than sitting unused.
+
+**Volume.**  `set_audio_volume()` was pygame's music mixer, and the robot's speech
+never goes through it — it is played by `paplay` to the Bluetooth sink, which sat
+at 83% whatever the app asked for.  `voice.py` now owns the output level
+(`sink_volume()`/`set_sink_volume()`, `pactl` with `amixer` behind it), `app.py`
+exposes `GET|POST /volume`, and the Command Center's header carries a slider whose
+value comes from the robot and is sent back debounced.  Proven live through the
+slider itself (UI Automation): the panel opened at the robot's 83, `40`, `65`,
+`25` all landed on the Pi, and `83` was restored.  The route clamps (`150` → 100)
+and refuses nonsense (`level=loud` → 400 "is not a number").
