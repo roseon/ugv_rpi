@@ -214,7 +214,7 @@ class EyeGazer:
                  hz=10.0, cam_hz=2.0, hold_s=0.5, conf=0.30,
                  screen_fov_deg=DEFAULT_SCREEN_FOV_DEG,
                  model="yolov8n.pt",
-                 link=None, detector=None, clock=time.time):
+                 link=None, detector=None, on_hits=None, clock=time.time):
         self.base = base
         self.cvf = cvf
         self.hz = max(0.5, float(hz))
@@ -228,6 +228,9 @@ class EyeGazer:
 
         self._link = link                 # injectable for tests / dry runs
         self._detector = detector         # callable(frame) -> [{'name','conf','box'}]
+        # What the last camera pass saw, handed to whoever speaks for the robot.
+        # The gaze reports, it does not decide what is worth saying.
+        self._on_hits = on_hits
         self._clock = clock
         self._model = None
         self._model_failed = False
@@ -485,6 +488,14 @@ class EyeGazer:
         self._cam_persons = sum(1 for h in hits
                                 if str(h.get("name", "")).lower() in PERSON_LABELS)
         self._detections = self._normalise(hits, frame)
+        if self._on_hits is not None:
+            # The eyes are the robot's only look at the room at this rate, so a
+            # speaking side-effect belongs here -- but a fault in it must never
+            # break the gaze, which is what the user is actually watching.
+            try:
+                self._on_hits(hits)
+            except Exception as e:                               # noqa: BLE001
+                print(f"[eyes] object speech failed: {e}")
 
         height, width = frame.shape[:2]
         # People first.  The largest box in a room is often furniture, and the

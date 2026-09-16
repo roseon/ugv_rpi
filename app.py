@@ -387,7 +387,11 @@ cvf.self_driver = self_driver
 # too close (LIDAR proximity) or at whatever the camera recognises.  This is the
 # single writer of gaze commands; eyes/pi_eyes.py only reads /eyes_status and
 # opens neither the Uno nor the camera.
-eye_gazer = eyes_gaze.EyeGazer(base, cvf, root=thisPath)
+#
+# Every camera pass is also when the robot can say what it recognised, so the
+# gaze is handed the CV side's speaking hook (object_speech owns the what/when).
+eye_gazer = eyes_gaze.EyeGazer(base, cvf, root=thisPath,
+                               on_hits=cvf.speak_detected_object)
 
 # Self-drive can run as a standalone capable mode: it drives forward and
 # learns the room while avoiding what it has already mapped. 'capable' on
@@ -997,6 +1001,12 @@ def toggle_eyes():
 def eyes_status():
     """What the eyes are looking at right now, and what put them there."""
     return jsonify(eye_gazer.status())
+
+@app.route('/object_speech', methods=['GET'])
+def object_speech_table():
+    """Every object the robot can name, the Minionese it says for it, and what
+    it said last -- so the library can be read whole instead of sampled."""
+    return jsonify(cvf.object_speech.report(cvf))
 
 @app.route('/selfdrive', methods=['POST'])
 def toggle_selfdrive():

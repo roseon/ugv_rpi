@@ -24,6 +24,7 @@ import logging
 from sklearn.linear_model import LinearRegression
 import speech_face  # what the mouths are drawn from (Pi screen + desktop)
 import voice        # the robot's voice: every speech path goes through it
+import object_speech  # what it says about the objects it recognises
 from datetime import datetime  # Ensure this is imported correctly
 # Libraries for CSI camera
 from picamera2 import Picamera2
@@ -262,6 +263,8 @@ class OpencvFuncs():
         self.cv_event.clear()
         self.cv_mode = f['code']['cv_none']
         self.detection_reaction_mode = f['code']['re_none']
+        # One owner of what the robot says about the objects it recognises.
+        self.object_speech = object_speech.ObjectSpeech()
 
         self.this_path = project_path
         self.photo_path = self.this_path + '/templates/pictures/'
@@ -846,6 +849,7 @@ class OpencvFuncs():
                     {'name': n, 'confidence': c, 'box': b}
                     for n, c, b in zip(objects, confidences, boxes)
                 ]
+                self.speak_detected_object(self.last_detections)
                 # Summary line at top
                 if objects:
                     from collections import Counter
@@ -896,6 +900,7 @@ class OpencvFuncs():
             {'name': n, 'confidence': c, 'box': b}
             for n, c, b in zip(objects, confidences, boxes)
         ]
+        self.speak_detected_object(self.last_detections)
         self.overlay = overlay_buffer
         return objects, confidences, boxes
 
@@ -1515,7 +1520,16 @@ class OpencvFuncs():
     def listen_for_question(self):
         with self.microphone as source:
             self.speak_minion("Listening boss.")
-            audio = self.recognizer.listen(source, timeout=5)
+            # Hold the voice for exactly as long as the microphone is open.  The
+            # robot now names objects it recognises on its own, and one of those
+            # lines landing in this window would be transcribed as the user's
+            # question.  Held only around the listen: the answer below is spoken
+            # through speak_minion, which stays quiet while this flag is set.
+            self.speaking = True
+            try:
+                audio = self.recognizer.listen(source, timeout=5)
+            finally:
+                self.speaking = False
             try:
                 question = self.recognizer.recognize_google(audio).lower()
                 print(f"Recognized question: {question}")
@@ -1526,6 +1540,19 @@ class OpencvFuncs():
             except Exception as e:
                 logging.error(f"Error in listen_for_question: {e}")
                 self.speak_minion("Oops boss, something went wrong.")
+
+    def speak_detected_object(self, detections):
+        """Name the most salient thing a detection pass just saw, in Minionese.
+
+        Called from every pass that looks with the camera (the eyes' gaze via
+        ``on_hits``, and the object-detection CV mode).  The decision is
+        ``object_speech``'s -- this only hands the line to the one voice, off
+        the detecting thread, because speaking blocks for the whole sentence.
+        """
+        text = self.object_speech.choose(detections, busy=self.speaking)
+        if text:
+            threading.Thread(target=self.speak_minion, args=(text,),
+                             daemon=True).start()
 
     def speak_minion(self, text):
         """Speak `text` in the robot's Minion voice (see voice.py).

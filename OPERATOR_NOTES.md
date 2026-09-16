@@ -561,3 +561,77 @@ which looks exactly like a dead robot. Hit three times while building this —
 including in `deploy.sh`, whose `[ -f face_screen.py ]` test made every deploy
 print both "reloaded" and "could not reach the robot". The deploy now names only
 the launcher.
+
+### The robot names what it recognises, and the words are Minionese (Sep 16)
+
+The request was a library of detected objects that "respond in Minions": people,
+chairs, walls, flower.  What was missing was not a word list — `cv_ctrl` already
+owns the vocabulary its detector can name (468 names: the COCO-80 its closed-set
+model emits plus everything the seed list and `learn_object()` have taught) — but
+any path from a detection to a spoken response.  `object_speech.py` is that path,
+and it owns three things: the **reaction** a Minion gives an object of that kind,
+the **name** (the object's own word), and **when** it may be said.  The vocabulary
+is read from its owner, never copied, so a newly taught name is speakable at once.
+
+Words still come only from `minionese.py`.  The corpus teaches a word for 10 of
+the 468 names — `chair` is `Soka`, `banana` is `Banana`, and `person` is `Boss`,
+which is why a person is greeted rather than invented.  The other 458 get an
+invented word and the table says so:
+
+| the robot sees | it says | source | why |
+|---|---|---|---|
+| `person` | `Bello boss` | taught | hello + the corpus's word for a person |
+| `chair` | `Soka` | taught | the corpus's own word |
+| `flower` | `Hmmokana` | invented | the corpus teaches no word for a flower |
+| `dog` | `Kiss kiss atokanpa` | invented | the reaction is taught; the noun is not |
+| `knife` | `Whaaa batokana` | invented | danger first, then the invented noun |
+| `car` | `Matoka bokazilo` | invented | "look at that", then the invented noun |
+
+That split is the whole reason the reaction layer exists: with 98 % of nouns
+invented, a table of invented words would sound like a robot, and a Minion phrase
+in front of it sounds like a Minion.  Reactions come from the corpus's own
+phrases (`hello`, `muak muak muak`, `danger`, `look at that`) and the suite fails
+if one of them is not a key the corpus taught.  Kinds are explicit name lists, not
+substrings: `mouse` is a computer mouse in COCO and `fire hydrant` is not a fire.
+
+**When** is a policy, not a chat log: one line per `GAP_S` (6 s), no object twice
+in a row, and each object at most once per `LABEL_COOLDOWN_S` (90 s), all
+suppressed while the robot is speaking.  When several things are in view a person
+is named before the largest thing, because a room's biggest box is usually
+furniture.  Measured live, on the robot's own camera (the gaze's 2 Hz pass is what
+feeds it; `/object_speech` is the whole library and what it said last):
+
+| time | what happened |
+|---|---|
+| 09:14:16 | camera sees a person; quiet — it was already named 81 s earlier |
+| 09:14:43 | `person` re-named at **exactly 90 s** — the cooldown, on a person who never left the frame |
+| 09:15:13–09:15:43 | a bottle is in view continuously and named **once**; the person stays quiet for its cooldown |
+| 09:15:56 | `SPEAKING text='Wika soka'` — a **chair** detected, `Soka` spoken (`Wika` is the voice's opening word) |
+| 09:16:13 | `SPEAKING text='Tulaliloo batokula'` — a **bottle**, its invented word `Batokula` |
+| 09:24:55 | the same bottle again at 94 s — the cooldown again, after a deploy restart |
+
+The spoken text is read from `/speech_status`, which publishes the words the voice
+actually synthesised, so this is the words leaving the speaker and not the words
+the code chose.
+
+One seam had to be closed for this: the robot now speaks on its own, and
+`listen_for_question()` leaves the microphone open for 5 s after the wake word,
+so a line landing there would be transcribed as the user's question.  The voice is
+held for exactly that window (`self.speaking`), and released before the answer is
+spoken — `speak_minion` refuses to talk while that flag is set, so holding it
+across the answer would have silenced Lance's replies.
+
+Named gaps, all measured rather than assumed:
+
+* **a wall cannot be spoken, because this robot cannot detect one.**  `wall`,
+  `floor`, `door`, `window`, `ceiling` are not in the vocabulary the detector
+  names, so they are not in the table either.  Adding them means widening what
+  YOLO-World looks for (and re-embedding), a change to detection behaviour rather
+  than to this library — and `learn_object("wall")` already exists for the moment
+  it is wanted.
+* **the detector's mistakes get named.**  A "motorcycle" at ≥ 0.40 confidence
+  indoors was named `Matoka nonniono`.  `CONF_FLOOR` is the one knob for that.
+* **the object-detection CV mode calls the same hook** (`cv_detect_objects`), but
+  every live line above came through the gaze's camera pass — that mode is
+  selected over socket.io, so it was not exercised this pass.
+
