@@ -1346,6 +1346,50 @@ after = mem_cov.covered_cells
 check("driving on covers more floor than standing still", after > first,
       (first, after))
 
+# Battery sag: the guard parks the robot and speaks before the undervoltage
+# cutoff parks the Pi.  Pure state machine in battery_guard.py; the announce
+# text is the corpus's own alarm Minionese.
+print("--- 8. battery sag parks and announces ---")
+import battery_guard as bg
+
+g = bg.BatteryGuard()
+# a hill or a reverse burst: one soft-dip reading must not park the robot
+check("a single soft dip does not park", g.update(9.7, 0.0) == 'ok', g.state)
+check("...and it does not linger: a healthy reading clears it",
+      g.update(10.4, 1.0) == 'ok' and g.low_sag_since is None, g.state)
+check("sag below the threshold for the sustain window parks",
+      g.update(9.7, 2.0) == 'ok'
+      and g.update(9.7, 8.2) == 'low' and g.latched, g.state)
+check("the announce is the corpus's own alarm",
+      "Bee do bee do" in bg.battery_guard_announce(), bg.ANNOUNCE)
+# recovery: latched means latched — one glance at a charged pack is not enough
+check("latched holds through soft readings",
+      all(g.update(9.9, t) == 'low' for t in (10.0, 20.0, 30.0)), g.state)
+check("latched holds through a brief healthy glance",
+      g.update(10.8, 31.0) == 'low', g.state)
+check("a sustained rest above the threshold re-arms",
+      all(g.update(10.8, t) == 'low' for t in range(32, 60))
+      and g.update(10.8, 61.1) == 'ok' and not g.latched, g.state)
+# the deep dip: no grace period
+check("one critical reading parks at once",
+      g.update(9.2, 62.0) == 'critical' and g.latched, g.state)
+check("a missing voltage reading is not news",
+      g.update(None, 63.0) == 'critical' and g.update(0, 64.0) == 'critical',
+      g.state)
+
+def volt(base, v):
+    b = types.SimpleNamespace()
+    b.base_data = {'odl': 0.0, 'odr': 0.0, 'v': v}
+    return b
+
+# the guard reads the voltage the app actually carries (the flipped sign must
+# not have touched it) and refuses nothing when the pack is healthy
+guard, _ = planner()
+check("the planner's voltage feed is untouched by the odometry flip",
+      guard._wheels.step(volt(guard._base, 11.5)) is None
+      and robot_state.wheel_odometry(volt(guard._base, 11.5))['voltage'] == 11.5,
+      robot_state.wheel_odometry(volt(guard._base, 11.5)))
+
 print()
 print("RESULT: %d failures" % len(FAILS))
 if FAILS:

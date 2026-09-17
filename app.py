@@ -50,6 +50,7 @@ import cv_ctrl
 import audio_ctrl
 import os_info
 import voice
+from battery_guard import BatteryGuard, battery_guard_announce
 import self_drive
 import eyes_gaze
 from perception import sector_min as _sector_min, turn_bias as _turn_bias
@@ -164,8 +165,16 @@ class LidarAvoider:
         interval = 1.0 / LOOP_HZ
         while not self._stop_evt.is_set():
             t0 = time.time()
+            try:
+                # every tick, active or not: the joystick sags the pack too,
+                # and it does not come through the avoider
+                _battery_tick()
+            except Exception as e:
+                logging.warning("[battery guard] %s", e)
             if self._active:
                 try:
+                    # the guard rides the loop where the base data is fresh;
+                    # defined below, once avoider and voice both exist
                     scan = LidarScan.read(self._base)
                     if not scan.empty:
                         self._decide(scan.angles, scan.distances)
@@ -407,6 +416,37 @@ cvf = cv_ctrl.OpencvFuncs(thisPath, base)
 # LIDAR avoider (starts later in __main__ if use_lidar is true)
 avoider = LidarAvoider(base)
 cvf.avoider = avoider  # hand Lance (voice brain) a handle to pause/resume avoidance
+
+# The pack that strands the robot: an earlier session drove the battery to the
+# undervoltage cutoff (~9.0 V) and the Pi died mid-drive, state unknown.  The
+# avoider's own 10 Hz loop ticks the guard against every voltage reading the
+# ESP32 frame carries; a sustained sag (or one deep dip) parks everything and
+# speaks — in the corpus's own alarm Minionese — while there is still pack
+# left to park with.  Recovery latches until the resting pack proves itself.
+battery_guard = BatteryGuard()
+_battery_announced = [False]   # one announcement per latch, in another thread
+
+def _battery_tick():
+    """Judge the latest voltage; park and announce when the sag counts.
+
+    The park is re-asserted on every tick while the guard is latched, not
+    issued once: the manual-control watchdog re-enables avoidance and
+    self-drive on its own timer, and a guard that only parks once watches
+    the robot drive away again at 9.1 V — which is exactly what happened
+    on the first live trip.  Announcing stays once per latch.
+    """
+    battery_guard.update((base.base_data or {}).get('v'))
+    if not battery_guard.latched:
+        _battery_announced[0] = False
+        return
+    if self_driver.active or avoider._active:
+        _selfdrive_off()         # wheels halted, planner off, every tick needed
+    if _battery_announced[0]:
+        return
+    _battery_announced[0] = True
+    cvf.info_update("BATTERY LOW - parked", (255, 64, 0), 4.0)
+    threading.Thread(target=voice.speak, args=(battery_guard_announce(),),
+                     daemon=True).start()
 # Self-driving planner: learns surroundings (lidar grid + camera objects) and
 # steers the avoider's cruise toward safe headings. Started idle at boot.
 self_driver = self_drive.SelfDriver(
@@ -1722,6 +1762,11 @@ def manual_control_watchdog():
         if not avoider._active and f['base_config']['use_lidar']:
             if _last_manual_cmd_time > 0 and \
                time.time() - _last_manual_cmd_time > MANUAL_PAUSE_SEC:
+                if battery_guard.latched:
+                    # the guard owns the wheels while the pack is low; a
+                    # re-arm here would fight the park and win for the
+                    # 0.5 s until the guard re-asserts it
+                    continue
                 avoider.resume()
                 self_driver.enable()
                 logging.info("[app] Avoidance re-enabled by watchdog")

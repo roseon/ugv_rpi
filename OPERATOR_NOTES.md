@@ -1011,3 +1011,46 @@ feedback stayed alive throughout.  That is undervoltage protection cutting
 motor power while the Pi's rail keeps running.  Charge the pack, then re-run the
 drive probe: the course/novelty/coverage behaviour is proven in the harness but
 the on-floor Roomba run waits on a charged battery.
+
+## The battery guard: park and say so before the cutoff says nothing (Sep 17)
+
+The cutoff at ~9.0 V is not a shutdown anyone can act on — the Pi dies
+mid-drive and the robot's state is unknown until someone walks over.  A
+guard now rides the avoider's 10 Hz loop (`battery_guard.py`, ticked from
+app.py): a pack that sags below 9.80 V for 6 s of driving — or touches
+9.25 V once — parks the planner and the wheels through the same
+`_selfdrive_off()` composite the /selfdrive route uses, shows
+"BATTERY LOW - parked" on the video overlay, and speaks the corpus's own
+alarm — "Bee do bee do bee do! Battery low. Banana time - me go home!" —
+through the one Minionese voice path.  Recovery is latched: the pack must
+hold 10.60 V at rest for 30 s before self-drive will trust it again.
+Proven: the state machine in the harness (dip-vs-sustain, latch,
+recover-by-rest, missing readings), the announcement through the real
+voice on the robot, the wiring through a clean deploy and boot.  The
+in-app trip itself has not been watched on a real sag, because the pack
+reads 9.86 V at rest — nearly empty — and discharging it further to watch
+a park is exactly what the guard is for the operator to decide.
+
+## The fresh-map acceptance, and what it really showed (Sep 17, later)
+
+Clearing the map did NOT restore the 99% near-0 heading discipline: on a
+completely empty map the same cluttered room gave 47% (28/59 clear samples
+near straight, 11 wide while clear, course re-formed 83 times in 61.7 m).
+The refuted hypothesis: legacy busy cells fencing headings.  The real
+story: the 99% run was the one where the odometry sign was still wrong —
+the pose never moved, the memory never knew where the robot was, so it
+could veto nothing.  That "discipline" was the memory being blind.  With
+the pose tracking, the map genuinely knows the room and turns the robot
+early — at corners and remembered walls, before the front cone sees them
+(11 wide turns all happened while the front cone was clear).  Coverage
+21 -> 574 cells, 118/119 samples moving, no stalls: the robot is doing
+Roomba cornering, not pirouetting.  Judge heading discipline by travel
+efficiency and coverage growth, not by straightness alone.
+
+The same run caught a real defect in the guard's first wiring: the
+manual-control watchdog re-enabled self-drive over the guard's park
+(min 9.13 V measured under load), and the guard's announce-once flag had
+become an enforce-once flag — it stayed silent while the robot drove
+away at 9.1 V.  The guard now re-asserts its park on every tick while
+latched, the watchdog stands down while latched, and announcing stays
+once per latch.  Deployed; robot parked at 9.77 V resting.
