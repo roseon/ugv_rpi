@@ -72,8 +72,14 @@ MEM_BLOCK_CLEAR = 0.34   # below this fraction of a near arc the heading is refu
 # pirouetting in place instead of covering floor.  With it the robot turns the
 # minimum a block demands, then carries on along its old line.
 COURSE_HOLD_S = 6.0       # a course older than this is stale and re-established
-COURSE_BIAS   = 1.0       # weight of the held course inside the goal term
-COURSE_MAX_DEG = 90.0     # beyond this from the held course the bias falls off
+COURSE_BIAS   = 1.8       # weight of the held course inside the goal term.
+                          # 1.0 let the memory's early cornering win near walls
+                          # (mean |turn| 0.359 vs 0.194 in the open); 1.8 makes
+                          # leaving the line cost double, so only a clearly
+                          # safer or clearly freer heading outbids it
+COURSE_MAX_DEG = 130.0    # beyond this from the held course the bias falls off
+                          # (90 made a 45-deg detour lose half its course pull;
+                          # 130 keeps mid-angle headings partially anchored)
 
 # ── what the learned map is for ──────────────────────────────────────────────
 # The grid is place-referenced now, which is what makes it worth driving on: a
@@ -439,8 +445,17 @@ class SelfDriver:
             if pursuing and lidar_clear < policy.veto_clear:
                 return None                      # live obstacle in the way
             near = self.memory.clearance(heading_rad, MEM_RADII[0])
-            if map_veto and near < MEM_BLOCK_CLEAR:
-                return None                      # remembered obstacle in the way
+            if map_veto and near < MEM_BLOCK_CLEAR \
+                    and lidar_clear < policy.veto_clear:
+                # Remembered obstacle in the way — but only when the live scan
+                # also refuses the heading.  On its own, the veto made the robot
+                # lurch toward far-side gaps it did not need (+80..110 deg wins
+                # with the front cone clean): the memory's view of a wall-edge
+                # outranked a live-clear corridor, and the wobble the EMA and
+                # slew were built to smooth was the score flip that followed.
+                # Measured live: mean |turn| near walls 0.359 vs 0.194 in the
+                # open, all wide turns with the front cone clear.
+                return None
             mem_clear = min(near, self.memory.clearance(heading_rad, MEM_RADII[1]))
             goal_term = policy.goal_term(heading, bearing)
             if goal_term is None:

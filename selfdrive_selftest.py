@@ -1185,9 +1185,17 @@ for i in range(-7, 8):
 drv, _ = planner(mem=mem5)
 ticking(drv)     # no planner thread: this harness ticks it
 drv._tick()
-check("a remembered obstacle refuses the heading into it and turns instead",
-      dict(drv.last_scores)[0] is None and not drv.halt
-      and drv.suggested_turn != 0.0, drv.last_decision)
+# The memory veto is no longer a hard refusal on its own: on the robot it fired
+# while the live scan showed the corridor clear, and the robot lurched toward
+# far-side gaps (+80..110 deg with the front cone clean) — the wall-adjacent
+# wobble.  The map still keeps the blocked heading last on score, and still
+# refuses a heading the live scan confirms blocked.
+check("a remembered obstacle turns the robot away by score, not by refusal",
+      dict(drv.last_scores)[0] is not None and not drv.halt
+      and abs(drv.suggested_turn) > 0.0, (drv.last_decision, drv.last_scores))
+check("...and the heading into it scores below the clear ones",
+      dict(drv.last_scores)[0] < max(s for s in dict(drv.last_scores).values()
+                                     if s is not None), drv.last_scores)
 drv.stop()
 
 mem6 = spatial_memory.SpatialMemory()
