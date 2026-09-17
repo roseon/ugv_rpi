@@ -124,6 +124,30 @@ public sealed class RobotClient : IAsyncDisposable
         SpeechChanged?.Invoke();
     }
 
+    /// <summary>
+    /// Poll the robot's Wi-Fi health. Slow on purpose (the radio does not move
+    /// that fast, and nmcli scans cost the Pi): this feeds the header strip, not
+    /// any control. An unreachable robot keeps the last known state — the strip
+    /// must not flap to "no wifi" just because the Pi's app was mid-restart.
+    /// </summary>
+    public async Task PollNetworkAsync(CancellationToken ct)
+    {
+        try
+        {
+            var j = await GetJsonAsync("/network_status");
+            State.Network = NetworkInfo.Parse(j);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+        catch (HttpRequestException h) when (h.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            State.Network = NetworkInfo.Unavailable("not deployed (update the robot's app)");
+        }
+        catch (Exception) { /* unreachable: keep the last known wifi state */ }
+        NetworkChanged?.Invoke();
+    }
+
+    public event Action? NetworkChanged;
+
     /// <summary>Make the robot speak. Throws with the robot's own reason if it will not.</summary>
     public async Task SayAsync(string text)
     {
@@ -379,6 +403,9 @@ public sealed class RobotClient : IAsyncDisposable
         // Faster than the eyes: the mouth has to notice a sentence starting, and
         // the envelope is what keeps it in time once it has.
         var speechTimer = new PeriodicTimer(TimeSpan.FromMilliseconds(250));
+        // The wifi strip is the slowest poll: nmcli costs the Pi, and a radio
+        // changes state on the order of seconds, not milliseconds.
+        var netTimer = new PeriodicTimer(TimeSpan.FromSeconds(5));
 
         _ = Task.Run(async () =>
         {
@@ -390,6 +417,12 @@ public sealed class RobotClient : IAsyncDisposable
         {
             while (await speechTimer.WaitForNextTickAsync(ct))
                 await PollSpeechAsync(ct);
+        });
+
+        _ = Task.Run(async () =>
+        {
+            while (await netTimer.WaitForNextTickAsync(ct))
+                await PollNetworkAsync(ct);
         });
 
         _ = Task.Run(async () =>

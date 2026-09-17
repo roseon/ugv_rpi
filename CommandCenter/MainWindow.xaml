@@ -22,6 +22,12 @@
                 <TextBlock x:Name="ConnDetail" Text="" Foreground="#FFFFAB91" VerticalAlignment="Center"
                            Margin="10,0,0,0" MaxWidth="620" TextTrimming="CharacterEllipsis"/>
                 <TextBlock x:Name="LidarWarn" Text="" Foreground="#FFFFB74D" VerticalAlignment="Center" Margin="16,0,0,0"/>
+                <!-- The robot's own wifi, not this PC's link: SSID + signal when it
+                     is home, what the watchdog is doing when it is not. Tooltip
+                     carries the history (last reconnects, reboots, pinned profile). -->
+                <TextBlock x:Name="WifiText" Text="" VerticalAlignment="Center" Margin="16,0,0,0"
+                           FontWeight="SemiBold" ToolTipService.InitialShowDelay="200"
+                           ToolTip="the robot's wifi — waits for /network_status"/>
                 <TextBlock Text="🔊" VerticalAlignment="Center" Margin="18,0,4,0"/>
                 <Slider x:Name="VolumeSlider" Width="130" Minimum="0" Maximum="100"
                         VerticalAlignment="Center" ValueChanged="OnVolumeChanged"

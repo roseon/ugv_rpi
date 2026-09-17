@@ -34,7 +34,46 @@ public partial class MainWindow : Window
         {
             if (e.PropertyName == nameof(RobotState.LidarHwText))
                 Dispatcher.Invoke(() => LidarWarn.Text = _robot.State.LidarHw ? "" : "⚠ LIDAR silent — check sensor power/cable");
+            if (e.PropertyName == nameof(RobotState.Network))
+                Dispatcher.Invoke(ShowWifi);
         };
+
+        void ShowWifi()
+        {
+            var net = _robot.State.Network;
+            WifiText.Text = net?.HeaderLine ?? "";
+            WifiText.Foreground = (net?.HeaderBrushKey) switch
+            {
+                "ok" => System.Windows.Media.Brushes.MediumSpringGreen,
+                "warn" => System.Windows.Media.Brushes.Orange,
+                _ => System.Windows.Media.Brushes.DarkGray,
+            };
+            // The history lives in the tooltip, out of the way of the strip.
+            WifiText.ToolTip = TooltipFor(net);
+        }
+
+        static string TooltipFor(NetworkInfo? net)
+        {
+            var wd = net?.Watchdog;
+            if (wd == null) return "the robot's wifi — no watchdog report";
+            if (!wd.Installed) return "watchdog not installed — run wifi_default.sh --install on the robot";
+            var lines = new List<string>
+            {
+                $"watchdog: {(wd.Active ? "running" : "installed, not active")}" +
+                (wd.Profile is { Length: > 0 } ? $" (pinned '{wd.Profile}')" : ""),
+            };
+            if (wd.Reconnects.Count > 0)
+            {
+                lines.Add("last reconnects:");
+                foreach (var r in wd.Reconnects.Take(3))
+                    lines.Add($"  +{r.AfterS:0}s  {DateTimeOffset.FromUnixTimeSeconds((long)r.T).LocalDateTime:MMM d HH:mm}");
+            }
+            else lines.Add("no reconnects yet");
+            if (wd.Reboots > 0) lines.Add($"recovery reboots: {wd.Reboots}");
+            return string.Join("\n", lines);
+        }
+
+        ShowWifi();
 
         Closed += async (_, _) => { await _robot.DisposeAsync(); };
         ConnectBtn_Click(null, null);   // auto-connect to the remembered host

@@ -1089,3 +1089,57 @@ solid through a 60 s watch.  The battery guard now also logs every state
 change and a 30 s heartbeat (`[battery] v=... state=... latched=...`),
 because a guard whose state is invisible reads as a guard that never
 fired.
+
+## The wall follower: matching the wall, not fighting it (Sep 17, night)
+
+"Still swivelling beside walls" survived the veto fix because the
+clearance score can never express "hold a line parallel to the wall":
+any heading angled off the wall reads as safer clearance, so near a wall
+the winner alternates between course-pull and clearance-pull.  The fix
+is Roomba's actual trick: when a side wall is in reach (perception
+.side_wall picks the most abeam solid return within 0.15..1.3 m), a P
+regulator on the standoff error SUPPLIES the cruise course anchor —
+"parallel at 0.85 m, tilted at most 20 deg" — and the existing
+COURSE_BIAS/EMA/slew/deadband damping shapes it.  The anchor is
+re-derived from the live scan every tick, so odometry drift never bends
+the line; its goal weight is raised (WALL_GOAL_MULT 2.5) because W_LIDAR
+and W_MEM both prefer headings angled off a wall in reach and at the
+plain weight the robot drifted out of reach instead of reeling back to
+its standoff.  A 1.2 s hold keeps the line through sensor gaps.
+
+Pinned in selfdrive_selftest section 9 (both sides): level-at-standoff
+aims along the wall, too-close steers away small, too-far steers in
+small, a closing nose is caught, the turn never changes sign while
+following, the gap-hold releases on expiry, open floor drops the anchor.
+One harness lesson worth keeping: teleporting the wall between cases
+while the pose stands still makes the place-frame map honestly record
+two parallel walls — phantom cells a real drive never produces (the
+odometry moves the pose with the robot) — so the wall cases clear the
+map first.
+
+Not yet proven: the robot dropped off this PC's Wi-Fi mid-pass (the
+PC's own gateway unreachable — same link failure as before), so the
+wall follower has never run on the floor.  The live acceptance to run
+when the link returns: a wall-adjacent 120 s drive re-measuring mean
+|turn| near walls against the 0.359 baseline (expect well under 0.2,
+steady turn sign, coverage still climbing), robot parked after.
+
+## Wi-Fi health in the Command Center (Sep 17, night)
+
+The header strip no longer just goes grey when the robot drops off: it
+draws /network_status (5 s poll, deliberately slow — nmcli costs the
+Pi).  Robot side, wifi_status.py owns the reading (device state, SSID,
+signal, the watchdog's report and service state) and the route answers
+even when the module is not deployed, so an old build shows "update the
+robot's app" instead of a failure.  The watchdog now publishes its
+history (last reconnects with how long they took, recovery reboots,
+pinned profile) in wifi_default_report.json — history in $HOME, which
+survives a reboot, so "last reconnect" outlives the outage clock that
+must not.  The strip shows: SSID + signal (green) when home; "offline —
+watchdog retrying (last reconnect +Ns)" (amber) when the watchdog is
+working; "offline — no watchdog installed" when it is not; the tooltip
+carries the history.  Proven: both python suites offline (wifi_status
+8 probes, watchdog decision machine 9 probes, C# parse 8 probes against
+the exact payload wifi_status.assemble emits, dotnet build clean).
+Not yet proven: any of it against real NetworkManager or a real drop —
+the robot is still off this PC's dead Wi-Fi link.

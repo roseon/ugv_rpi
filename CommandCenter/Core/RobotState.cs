@@ -31,6 +31,12 @@ public class RobotState : System.ComponentModel.INotifyPropertyChanged
     string _connDetail = "";
     public string ConnDetail { get => _connDetail; set { _connDetail = value; Raise(nameof(ConnDetail)); } }
 
+    // The robot's own Wi-Fi health (its radio, not this PC's link to it), from
+    // /network_status: on the home network and how strong, or offline and what
+    // the watchdog is doing about it.  Null until the first answer arrives.
+    NetworkInfo? _network;
+    public NetworkInfo? Network { get => _network; set { _network = value; Raise(nameof(Network)); } }
+
     // ── config (fetched from /config) ──
     public double MaxSpeed = 0.5;
     public double SlowSpeed = 0.2;
