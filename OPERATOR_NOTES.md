@@ -863,6 +863,115 @@ The map file built before this fix was moved aside on the robot as
 walked 14.7 m makes its cells uninterpretable. The remembered area is bounded by
 `GRID_SIZE = 121` (±6 m) — the robot had already driven outside it.
 
+## The map keeps what it confirmed, and the Command Center shows the robot's map (Sep 16, later still)
+
+**The memory floor made noise permanent.**  `MEM_FLOOR = 1` kept every cell that
+had ever been seen, so stray returns accumulated forever: measured on the robot,
+**7,380 of 12,449 remembered cells had exactly one hit**, with a median distance of
+5.88 m — the edge of the sensor's range.  Distance said the same thing: **97% of
+the cells within 2 m had three hits or more, while 86% of everything remembered
+beyond 5.5 m was single-hit**.  A cell now earns the floor only by reaching
+`MIN_HITS` (three revolutions); a cell that never did decays to nothing, as it
+always used to.  A surface close enough to return several rays in one revolution —
+3° of turn is 0.1 m at 1.9 m, so several rays land in one cell — is still confirmed
+by that single sweep.  Live after the deploy: the loaded map fell from **12,406
+cells to 3,573** within seconds (1,865 confirmed, 1,650 remembered but no longer
+able to block), and a later drive settled at 9,953 cells with 6,127 confirmed.
+The panel draws cells with two hits or more, so what it shows is the occupancy that
+can still refuse a heading, not the whole history.
+
+**Learning runs while avoidance is on, and follows the wheels exactly.**  With
+*only* `/lidar_avoidance` enabled (self-drive off) and the robot driven by hand for
+0.75 s, the map moved the robot **0.33 m against 0.33 m of commanded wheel travel**
+and grew 3,574 → 3,868 cells, the cells it drove past climbing to the hit ceiling.
+That is the operator's "when I enable avoidance it should record and learn
+everything": the sampler is not the planner's job, so it runs whenever the app runs.
+
+**The Command Center panel was running a second driving brain.**  The Learning tab
+scored its own headings against its own `ObstacleMemory` — an occupancy grid in the
+robot's *instantaneous* frame with no pose, so the same wall landed in different
+cells as the robot drove — and drove the robot over the websocket, which pauses the
+robot's own avoider for 8 s.  That is the blob of red the operator was reading as
+"it is not learning" while the robot used a place-referenced map the panel could not
+see.  `ObstacleMemory.cs` and the client's reactive loop are gone; the panel reads
+`/surroundings`, `/selfdrive_status` and `/lidar_status`, draws the robot at its own
+pose in the map frame, and its Engage button switches on avoidance and the robot's
+self-drive together (Stop stops it; Save/Clear map go to `/selfdrive_map`).
+Taught-path replay and hue-follow stay — they are operator tools, not a second
+brain.  Proven through the running app with UI Automation: the panel read `6007
+cells remembered · robot at (-0.1, 0.2) m in the map · accepted`, clicking Engage
+produced the robot's own `heading -30° turn +0.49 cells 6834` and 7.0 m of travel,
+and Stop parked it.
+
+**Smoothness, measured.**  One self-drive run: **5.28 m in 14.9 s at 0.36 m/s with
+0 stalled intervals**, the turn command stepping by at most 0.22 between samples
+(range -0.69..0.54, so ramps rather than flips), and clearance falling to 350 mm
+without the robot stopping.
+
+**Object avoidance reads the camera pass the robot already runs (Sep 16, latest).**
+This paragraph used to say the planner's object map only filled while the CV overlay
+happened to be in an object mode, so live the camera saw one `surfboard` while the
+map held **0 objects**.  The stream that was missing was the gaze's own: it already
+runs the shared detector at `cam_hz` while the eyes are on and publishes every box
+it saw (`/eyes_status.detections`, as fractions of the frame).  `DetectionSource`
+now reads that pass first and the overlay's hits behind it, scaling the gaze's
+fractions into the pixels `box_bearing_deg` wants (a bearing is a difference of
+fractions, so the scale cancels), and `app.py` attaches the gaze to the planner's
+detection source once it exists.  Nothing extra is computed: this is the pass the
+eyes pay for anyway, not a second ~1.3 s/frame detector on a Pi already at load 3.7.
+
+Freshness is the gaze's own verdict rather than a second rule: a status that is
+disabled, has a frozen camera frame (`frame_stale`) or has stopped stepping (`age_s`
+past `GAZE_MAX_AGE_S = 5 s`) feeds the planner nothing — so switching the eyes off
+leaves the planner exactly as it was, and a wedged gaze cannot keep re-fusing its
+last boxes ten times a second.  Double counting needs no code either: both streams
+are read together and `observe_object` folds the same name, bearing and range into
+one object.
+
+Live on the robot's own camera, driving with the eyes on: the map held camera
+objects for the whole run (**43 of 42 samples** — `toothbrush`, `oven`, `suitcase`,
+`backpack`, `chair`, `person`) and the planner refused headings for them (`scores`
+came back `None` at 0°, ±15°, ±30°, ±45°, ±60°, ±80°, ±110°) while the robot still
+cruised — **42 samples over 15 s, 0 samples with under 0.01 m of wheel travel**,
+mean 0.12 m/s (min 0.058 m/s, in a 0.33-0.5 m view), turn steps at most 0.24 per
+0.25 s, which is the 0.08/tick slew cap, and **0.0000 m** of wheel travel after the
+stop.  `selfdrive_selftest.py` §7b pins it: the overlay gate, the three freshness
+gates, the both-streams dedupe, a person walking across the frame, and the LIDAR's
+place surviving a person who walked away.
+
+An object's grid disk is a claim about *now*, and the grid's own decay runs at the
+LIDAR's 6 s timescale — far too slow for something that walks.  `observe_detections`
+now remembers the cells its last batch covered and, when a new batch no longer covers
+them, drops them: a cell only the camera claimed goes back to nothing, while a cell
+the LIDAR has confirmed keeps its place and is put back below the blocking threshold
+(the next revolution or two restores it).  An object therefore never makes a cell
+*sure* — a place is a place because the LIDAR keeps seeing it.  Against the live map,
+switching the eyes off moved object cells from **241 (171 blocked) to 241 (160
+blocked)**: most object disks sit on LIDAR returns, and those are the LIDAR's places
+to keep or forget, not the camera's.
+
+**Where a detection really is: the LIDAR at its own bearing.**  The front cone used
+to be applied to every detection — live, `oven` was stored twice at the same bearing
+0.46 m and 1.7 m apart, and one view produced 20 entries for a handful of things —
+so a chair 30° off to the side could refuse a heading it was nowhere near.  A
+box's distance now comes from the 1-degree occupancy bins at the bearing the box
+is actually at (`self_drive._detection_range`, robot frame = raw − 180°, per
+`perception.LIDAR_ANGLE_OFFSET`), as wide as the box itself, freshness-gated and
+clamped; only when that sector answers nothing does the front cone stay the
+honest fallback.  Static on the robot (not driving, eyes publishing), a stored
+object's range sits at its LIDAR sector within **0.01 m median, 18 of 19 within
+0.2 m**; during a live drive the objects stay on what the camera names (`tv`,
+`person`, `chair`, `train`, `clock`, `refrigerator`) with the planner refusing
+the headings that point at them while still cruising.  The duplicate failure
+itself had a second root: nothing ever expired an entry, so a drive's ghosts
+were saved to `surroundings.json` and reloaded into every later session — the
+count had reached 268 for a room holding a handful of things.  An entry no batch
+has refreshed within `OBJ_TTL_S` (30 s) is now dropped, exactly like the cells:
+the list is what the camera currently claims, and it fell live from 268 to 7–26
+over one drive.  (One probe-measured artifact to not re-chase: while the robot
+*drives*, stored ranges lag the live sector by ~0.4 m median — that is the robot
+moving between fusion and sampling, not bad attribution; measure it static.)
+
 **Volume.**  `set_audio_volume()` was pygame's music mixer, and the robot's speech
 never goes through it — it is played by `paplay` to the Bluetooth sink, which sat
 at 83% whatever the app asked for.  `voice.py` now owns the output level
@@ -872,3 +981,33 @@ value comes from the robot and is sent back debounced.  Proven live through the
 slider itself (UI Automation): the panel opened at the robot's 83, `40`, `65`,
 `25` all landed on the Pi, and `83` was restored.  The route clamps (`150` → 100)
 and refuses nonsense (`level=loud` → 400 "is not a number").
+
+**Cruise now behaves like a floor cleaner, not a compass needle.**  The complaint
+"it keeps turning around" had a real policy root: the cruise goal was
+`-abs(heading)/180` — "prefer the bumper" — with no memory of the course being
+driven, so every block swung the robot toward whatever sector scored widest and
+it pirouetted (headings of ±80°, ±110° measured live).  Three changes, one
+owner each: the cruise goal holds a **course** (`self_drive._course_map`, the
+map-frame bearing of recent actual travel read from the map's pose, so a pivot
+doesn't rewrite it; scoring re-expresses it against the current heading and
+rewards turning back within `COURSE_MAX_DEG` = Roomba's minimum-turn rule); a
+gentle **novelty** term (`spatial_memory.novelty`, W_NOVEL = 0.5 vs safety's
+combined 3.2) breaks *equal-clearance* ties toward unmapped floor so open room
+gets covered instead of patrolled in circles — no-return rays (0 mm) leave floor
+unmapped while real walls map theirs, which is the freshness gate that stopped
+the old frontier wobble; and **covered floor** is counted (`covered_cells`, the
+disk the robot itself has driven over, published in `/selfdrive_status`) so
+mapping progress is one number the operator can watch grow.  Pinned in
+`selfdrive_selftest.py` (course kept through pivots, unmapped side outscores the
+mapped side at equal clearance through a real asymmetric scan, coverage grows
+with travel); all suites green.
+
+**Live proof is currently blocked by the battery, not the code.**  Deploying and
+driving showed the planner commanding turns while the wheel counters sat frozen
+to the last digit — 19 forward commands through the app's own
+`/send_command` path moved odometry exactly 0.000 m, voltage read 9.04–9.06 V
+(3.0 V/cell — empty for the 3S pack) and *rose* during the attempt, and ESP32
+feedback stayed alive throughout.  That is undervoltage protection cutting
+motor power while the Pi's rail keeps running.  Charge the pack, then re-run the
+drive probe: the course/novelty/coverage behaviour is proven in the harness but
+the on-floor Roomba run waits on a charged battery.

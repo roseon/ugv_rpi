@@ -425,6 +425,13 @@ cvf.self_driver = self_driver
 eye_gazer = eyes_gaze.EyeGazer(base, cvf, root=thisPath,
                                on_hits=cvf.speak_detected_object)
 
+# The gaze is the only camera pass the app already runs, so the planner's object
+# map reads it.  It used to read only the CV overlay's hits, which are refreshed
+# while the overlay happens to be in one of its object modes — so live, the
+# camera saw a surfboard and the map held no objects at all.  Wired here
+# because the gaze is built after the driver.
+self_driver.detections.gaze = eye_gazer
+
 # Self-drive can run as a standalone capable mode: it drives forward and
 # learns the room while avoiding what it has already mapped. 'capable' on
 # enables it; 'capable off' stops it (same ramp/stop as auto-drive).
@@ -971,6 +978,25 @@ def force_reboot():
 
 # ── LIDAR avoidance + self-drive control endpoints ───────────────────────────
 
+def _selfdrive_on():
+    """Start self-driving: the planner AND the avoider that drives its wheels.
+
+    The planner only suggests headings — the avoider is the executor that owns
+    the motors — so enabling the planner without it plans a course the robot
+    never drives (measured: 120 s of heading commands, odometry frozen), and
+    disabling only the planner left the avoider cruising straight on its own
+    (measured: 5.6 m of uncommanded travel after /selfdrive enable=false).
+    Both toggles go through this one composite so the pairing cannot drift.
+    """
+    avoider.resume()
+    self_driver.enable()
+
+def _selfdrive_off():
+    """Stop self-driving: pause the planner and halt the executor's wheels."""
+    self_driver.disable()
+    avoider.pause(halt=True)
+    _last_manual_cmd_time = 0.0
+
 @app.route('/lidar_avoidance', methods=['POST'])
 def toggle_lidar_avoidance():
     """Enable or disable LIDAR obstacle avoidance from the UI."""
@@ -1056,10 +1082,10 @@ def toggle_selfdrive():
     if target:
         self_driver.pursue(target)   # sets the target and switches driving on
     if enable:
-        self_driver.enable()
+        _selfdrive_on()
         msg = 'Self-drive enabled'
     else:
-        self_driver.disable()
+        _selfdrive_off()
         msg = 'Self-drive disabled'
     return jsonify({'status': 'success', 'message': msg,
                     'selfdrive_active': self_driver.active,
@@ -1864,10 +1890,10 @@ def cmdline_ctrl(args_string):
         # Self-driving planner:  selfdrive on | off | target <object> | clear
         if len(args) > 1:
             if args[1] == 'on':
-                self_driver.enable()
+                _selfdrive_on()
                 cvf.info_update("Self-drive ON", (0,255,0), 0.36)
             elif args[1] == 'off':
-                self_driver.disable()
+                _selfdrive_off()
                 cvf.info_update("Self-drive OFF", (0,128,255), 0.36)
             elif args[1] == 'target' and len(args) > 2:
                 # Drive toward a named object the camera can see.

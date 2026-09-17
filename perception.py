@@ -52,6 +52,17 @@ def box_bearing_deg(box, frame_width=FRAME_WIDTH_PX, fov_deg=H_FOV_DEG):
     return (0.5 - ((x1 + x2) / 2.0) / frame_width) * fov_deg
 
 
+def box_span_deg(box, frame_width=FRAME_WIDTH_PX, fov_deg=H_FOV_DEG):
+    """Camera box -> how wide it is, as an angle (+-x of the same pinhole).
+
+    What the box itself occupies in the camera's field of view, so a thing the
+    camera can see can be asked about in the LIDAR's own terms: how wide a look
+    at its bearing should be taken before believing no beams came back.
+    """
+    x1, _y1, x2, _y2 = box
+    return abs(x2 - x1) / float(frame_width) * fov_deg
+
+
 def v_fov_deg(frame_width=FRAME_WIDTH_PX, frame_height=FRAME_HEIGHT_PX,
               h_fov_deg=H_FOV_DEG):
     """The vertical FOV of the same pinhole.

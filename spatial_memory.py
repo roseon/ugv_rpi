@@ -44,6 +44,17 @@ heading, which is what keeps a chair that has since moved from steering forever.
 Measured before the floor existed: after a 5 m drive, 0 of 810 remembered cells
 lay beyond the LIDAR's own 6 m reach — the map was the current view, not a map.
 
+Only *confirmed* cells are floored.  A cell earns the floor by reaching
+MIN_HITS, i.e. by being seen on three separate revolutions; a cell that has only
+ever had one or two hits is not evidence of anything and decays to nothing, as
+it always did.  Without that distinction the floor made every stray return
+permanent: measured on the robot, 7,380 of 12,449 remembered cells had exactly
+one hit, with a median distance of 5.88 m — noise at the edge of the sensor's
+range, and all of it drawn on the operator's map.  Confirmed cells are the
+opposite shape: 97% of the cells within 2 m of the robot had three hits or more,
+so the room's real surfaces were already confirmed and the floor kept exactly
+the wrong half of the map.
+
 **The grid is a window on the frame, and the window follows the robot.**  A
 bounded array cannot hold an unbounded place frame, so when the robot drives
 more than CENTRE_KEEP_M from the middle of the grid the cells are shifted by a
@@ -90,6 +101,14 @@ DECAY_SEC    = 6.0       # stale evidence loses a count after this long
 OBJ_RANGE_MAX = 3.0      # metres — objects beyond this are remembered, not avoided
 OBJ_GRID_R   = 0.18      # metres — fused disk radius for an object in the grid
 OBJ_DEDUPE_M = 0.5       # metres — merge a sighting into a known object within this
+OBJ_TTL_S = 30.0         # an entry no batch has refreshed in this long is dropped
+                         # (a detection is a claim about now — and without expiry one
+                         # drive added 20 entries for a handful of things, then the
+                         # file kept reloading the ghosts into every later session)
+COVER_FLOOR_M = 0.25     # radius (m) of the floor disk around the robot that a
+                         # revolution marks as covered — how much of the room it
+                         # has actually patrolled, the number "learning like a
+                         # Roomba" is judged by
 DET_MIN_CONF = 0.30      # ignore camera boxes below this confidence
 
 # ── the frame guard ───────────────────────────────────────────────────────────
@@ -117,7 +136,19 @@ class SpatialMemory:
         self._hits = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
         self._free = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
         self._last = [[0.0] * GRID_SIZE for _ in range(GRID_SIZE)]
-        self.objects = []          # [{'name','bearing_deg','range_m','confidence','t'}]
+        self._sure = [bytearray(GRID_SIZE) for _ in range(GRID_SIZE)]
+        self._covered = [bytearray(GRID_SIZE) for _ in range(GRID_SIZE)]
+                                 # floor the robot has patrolled near (session-scoped:
+                                 # a reloaded map is remembered, not visited)
+                                   # this cell reached MIN_HITS once: a real
+                                   # surface, so its evidence is kept (MEM_FLOOR)
+                                   # instead of decaying to nothing like noise
+        self.objects = []          # [{'name','bearing_deg','range_m','confidence',
+                                   #   't','wx','wy'}] — the last two are where it
+                                   #   stands, which is what makes two sightings
+                                   #   one object
+        self._det_cells = set()    # cells the last camera batch marked: an
+                                   # object that moves gives them back
         self.pose = (0.0, 0.0, 0.0)   # map frame: x = left, y = forward, theta
         self.motion = 'unknown'    # accepted | rejected | unchecked | waiting
         self.motion_m = 0.0        # how far the last wheel step claimed
@@ -150,8 +181,8 @@ class SpatialMemory:
         if abs(kx) <= keep and abs(ky) <= keep:
             return False
 
-        def shifted(grid, fill):
-            out = [[fill] * GRID_SIZE for _ in range(GRID_SIZE)]
+        def shifted(grid, make):
+            out = [make() for _ in range(GRID_SIZE)]
             for x in range(GRID_SIZE):
                 sx = x + kx
                 if not 0 <= sx < GRID_SIZE:
@@ -163,9 +194,11 @@ class SpatialMemory:
                         dst[y] = src[sy]
             return out
 
-        self._hits = shifted(self._hits, 0)
-        self._free = shifted(self._free, 0)
-        self._last = shifted(self._last, 0.0)
+        self._hits = shifted(self._hits, lambda: [0] * GRID_SIZE)
+        self._free = shifted(self._free, lambda: [0] * GRID_SIZE)
+        self._last = shifted(self._last, lambda: [0.0] * GRID_SIZE)
+        self._sure = shifted(self._sure, lambda: bytearray(GRID_SIZE))
+        self._covered = shifted(self._covered, lambda: bytearray(GRID_SIZE))
         self.pose = (self.pose[0] - kx * CELL_M,
                      self.pose[1] - ky * CELL_M, self.pose[2])
         return True
@@ -200,6 +233,33 @@ class SpatialMemory:
                 if self._blocked_locked(wx, wy):
                     blocked += 1
         return 1.0 - blocked / float(samples)
+
+    def novelty(self, heading_rad, r=0.9, half_width_rad=0.35):
+        """0..1 — how much of this heading's arc is floor the map has not seen.
+
+        Cells whose rays are fresh count as mapped, so driving past something
+        stops making the way ahead look unknown (that wobble was why the first
+        frontier term was removed — the fix is the freshness gate, not the
+        removal).  At radius r ahead of the robot, same convention as clearance.
+        """
+        samples = 12
+        unknown = 0
+        with self._lock:
+            x, y, theta = self.pose
+            for i in range(samples):
+                a = heading_rad + (i - samples / 2.0) / (samples / 2.0) * half_width_rad
+                wx, wy = robot_to_world((x, y, theta), r * math.sin(a), r * math.cos(a))
+                cx, cy = self._cell(wx, wy)
+                if self._free[cx][cy] <= 0 or (self._last[cx][cy]
+                                               and time.time() - self._last[cx][cy] > 10.0):
+                    unknown += 1
+        return unknown / float(samples)
+
+    @property
+    def covered_cells(self):
+        """How many cells of floor the robot has actually patrolled near."""
+        with self._lock:
+            return sum(1 for row in self._covered for c in row if c)
 
     @property
     def busy_cells(self):
@@ -290,6 +350,8 @@ class SpatialMemory:
                 if self._hits[cx][cy] < HIT_MAX:
                     self._hits[cx][cy] += 1
                 self._last[cx][cy] = now
+                if self._hits[cx][cy] >= MIN_HITS:
+                    self._sure[cx][cy] = 1     # a real surface, not one stray ray
             self._decay_locked(now)
 
     def _step_pose(self, angles, distances):
@@ -334,9 +396,27 @@ class SpatialMemory:
             self.motion = 'rejected'
         self._remember_scan(angles, distances)
 
+    def _mark_covered_locked(self):
+        """Record the floor the robot is standing on as covered.
+
+        Coverage is the Roomba kind: the floor the robot itself has driven
+        over, a small disk around its own pose, not the surfaces its sensor
+        happens to see from afar.  Once per revolution, lock held.
+        """
+        x, y, theta = self.pose
+        r_cells = int(math.ceil(COVER_FLOOR_M / CELL_M))
+        cx0, cy0 = self._cell(x, y)
+        for dx in range(-r_cells, r_cells + 1):
+            for dy in range(-r_cells, r_cells + 1):
+                cx, cy = cx0 + dx, cy0 - dy
+                if 0 <= cx < GRID_SIZE and 0 <= cy < GRID_SIZE \
+                        and math.hypot(dx * CELL_M, dy * CELL_M) <= COVER_FLOOR_M:
+                    self._covered[cx][cy] = 1
+
     def _remember_scan(self, angles, distances):
         """Keep this scan as range-by-bearing, for the next move to be judged against."""
         self._recentre_locked()      # the window has to stay under the robot
+        self._mark_covered_locked()  # every completion path of _step_pose comes here
         bins = [None] * 360
         for a, d in zip(angles, distances):
             if d <= 0 or d > 6000:
@@ -376,7 +456,7 @@ class SpatialMemory:
             for y in range(GRID_SIZE):
                 if now - self._last[x][y] <= DECAY_SEC:
                     continue
-                if self._hits[x][y] > MEM_FLOOR:
+                if self._hits[x][y] > (MEM_FLOOR if self._sure[x][y] else 0):
                     self._hits[x][y] -= 1
                 if self._free[x][y] > 0:
                     self._free[x][y] -= 1
@@ -384,44 +464,124 @@ class SpatialMemory:
 
     def observe_object(self, name, bearing_deg, range_m, confidence):
         """Fuse one sighting into the object memory + grid."""
-        now = time.time()
         with self._lock:
-            for obj in self.objects:
-                if obj['name'] == name and abs(obj['bearing_deg'] - bearing_deg) < 15.0 \
-                        and abs(obj['range_m'] - range_m) < OBJ_DEDUPE_M:
-                    obj.update(bearing_deg=bearing_deg, range_m=range_m,
-                               confidence=confidence, t=now)
-                    break
-            else:
-                self.objects.append({'name': name, 'bearing_deg': bearing_deg,
-                                     'range_m': range_m, 'confidence': confidence,
-                                     't': now})
-            if range_m <= OBJ_RANGE_MAX:
-                r = max(CELL_M, OBJ_GRID_R)
-                steps = 8
-                for i in range(steps):
-                    ang = 2 * math.pi * i / steps
-                    fx = range_m * math.sin(math.radians(bearing_deg)) + r * math.sin(ang)
-                    fy = range_m * math.cos(math.radians(bearing_deg)) + r * math.cos(ang)
-                    wx, wy = robot_to_world(self.pose, fx, fy)
-                    cx, cy = self._cell(wx, wy)
-                    # Same HIT_MAX ceiling as lidar hits, but objects still count
-                    # double so one sighting stands out.
-                    self._hits[cx][cy] = min(HIT_MAX, self._hits[cx][cy] + 2)
-                    self._last[cx][cy] = now
+            self._fuse_object_locked(name, bearing_deg, range_m, confidence,
+                                     time.time())
         return len(self.objects)
 
-    def observe_detections(self, dets, front_range_m, min_conf=DET_MIN_CONF):
-        """Fuse a batch of camera detections seen from `front_range_m`."""
-        for det in dets or []:
-            name = det.get('name', '')
-            box = det.get('box')
-            confidence = float(det.get('confidence', 0.0))
-            if not name or not box or confidence < min_conf:
+    def _fuse_object_locked(self, name, bearing_deg, range_m, confidence, now):
+        """The object list entry and its grid disk.  Called with the lock held.
+
+        A sighting is merged into the object that is standing in the same place,
+        not into the one at the same bearing: as the robot turns and drives, the
+        same chair reappears at bearing after bearing, and matching on the
+        bearing turned one chair into an entry per viewpoint — measured live, 133
+        entries after a drive, for a room holding a handful of things.  Entries
+        written before places were kept (or by `observe_object`, which has no box
+        to range) fall back to that bearing-and-range rule.
+        """
+        wx, wy = robot_to_world(self.pose,
+                                range_m * math.sin(math.radians(bearing_deg)),
+                                range_m * math.cos(math.radians(bearing_deg)))
+        for obj in self.objects:
+            if obj['name'] != name:
                 continue
-            bearing = box_bearing_deg(box)
-            self.observe_object(name, round(bearing, 1), round(front_range_m, 2),
-                                confidence)
+            if obj.get('wx') is None:
+                same = (abs(obj['bearing_deg'] - bearing_deg) < 15.0
+                        and abs(obj['range_m'] - range_m) < OBJ_DEDUPE_M)
+            else:
+                same = math.hypot(obj['wx'] - wx, obj['wy'] - wy) <= OBJ_DEDUPE_M
+            if same:
+                obj.update(bearing_deg=bearing_deg, range_m=range_m,
+                           confidence=confidence, t=now, wx=wx, wy=wy)
+                break
+        else:
+            self.objects.append({'name': name, 'bearing_deg': bearing_deg,
+                                 'range_m': range_m, 'confidence': confidence,
+                                 't': now, 'wx': wx, 'wy': wy})
+        if range_m <= OBJ_RANGE_MAX:
+            # Same HIT_MAX ceiling as lidar hits, but objects still count
+            # double so one sighting stands out.  An object deliberately does
+            # not make a cell *sure*: it can walk away, and what keeps a place
+            # remembered at MEM_FLOOR is the LIDAR seeing it again and again.
+            for cx, cy in self._disk_cells(bearing_deg, range_m):
+                self._hits[cx][cy] = min(HIT_MAX, self._hits[cx][cy] + 2)
+                self._last[cx][cy] = now
+
+    def _disk_cells(self, bearing_deg, range_m):
+        """The grid cells an object at this bearing/range covers (lock held)."""
+        r = max(CELL_M, OBJ_GRID_R)
+        steps = 8
+        out = []
+        for i in range(steps):
+            ang = 2 * math.pi * i / steps
+            fx = range_m * math.sin(math.radians(bearing_deg)) + r * math.sin(ang)
+            fy = range_m * math.cos(math.radians(bearing_deg)) + r * math.cos(ang)
+            out.append(self._cell(*robot_to_world(self.pose, fx, fy)))
+        return out
+
+    def observe_detections(self, dets, front_range_m, min_conf=DET_MIN_CONF,
+                           range_for=None):
+        """Fuse a batch of camera detections seen from `front_range_m`.
+
+        `range_for(bearing_deg, box)` — when the caller can offer one — is that
+        detection's own distance, measured by the LIDAR at the bearing the box
+        is actually at; `front_range_m` is the fallback for a detection nothing
+        answers about.  The front cone used to be applied to every detection, so
+        a chair 30° off to the side was remembered 0.5 m ahead of the robot and
+        could refuse a heading the chair was nowhere near.
+
+        A detection is a claim about where things are *now*, so the cells the
+        previous batch marked and this one does not are released as soon as the
+        batch arrives: a person who has walked on must not keep refusing the
+        heading they were last seen at, and a trail of such disks would fence
+        the robot in.  The grid's own decay runs at the LIDAR's 6 s timescale,
+        which is far too slow for something that walks.
+
+        The entry list obeys the same clock.  An object no batch has refreshed
+        within OBJ_TTL_S is a claim nobody is making any more and is dropped,
+        so the count is what the camera actually sees: without expiry one view
+        left 20 entries for a handful of things and the map file reloaded the
+        ghosts into every later session, where their old world positions kept
+        them apart forever (four `person` entries at one bearing, live).
+        """
+        fresh = set()
+        now = time.time()
+        with self._lock:
+            for det in dets or []:
+                name = det.get('name', '')
+                box = det.get('box')
+                confidence = float(det.get('confidence', 0.0))
+                if not name or not box or confidence < min_conf:
+                    continue
+                bearing = round(box_bearing_deg(box), 1)
+                own = None if range_for is None else range_for(bearing, box)
+                range_m = round(front_range_m if own is None else own, 2)
+                self._fuse_object_locked(name, bearing, range_m, confidence, now)
+                fresh.update(self._disk_cells(bearing, range_m))
+            self._release_object_cells(fresh)
+            cutoff = now - OBJ_TTL_S
+            self.objects = [o for o in self.objects if o.get('t', now) >= cutoff]
+
+    def _release_object_cells(self, fresh):
+        """Forget the object evidence in cells no object claims any more.
+
+        An object disk is a claim about where things are *now*, so the moment
+        the camera stops covering a cell the claim goes with it: a person who has
+        walked on must stop refusing the heading they were seen at, and a trail
+        of such disks would fence the robot in.  A cell the LIDAR has confirmed
+        is left alone, because that is a place and the camera only ever saw it
+        behind whatever was standing there.
+        """
+        for cx, cy in self._det_cells - fresh:
+            if self._sure[cx][cy]:
+                # A place, not a claim: keep the cell, but it must stop refusing
+                # headings on the strength of a thing that has gone.  The next
+                # revolution or two puts its own evidence back.
+                self._hits[cx][cy] = min(self._hits[cx][cy], MIN_HITS - 1)
+            else:
+                self._hits[cx][cy] = 0
+        self._det_cells = fresh
 
     # ── persistence ───────────────────────────────────────────────────────
     def load(self):
@@ -446,7 +606,22 @@ class SpatialMemory:
                 if raw_free:
                     self._free = [[min(int(v), FREE_MAX) for v in row]
                                   for row in raw_free]
+                raw_sure = data.get('sure')
+                if raw_sure:
+                    self._sure = [bytearray(1 if v else 0 for v in row)
+                                  for row in raw_sure]
+                else:
+                    # A file written before cells were distinguished this way:
+                    # what it has confirmed is what its counts already say.
+                    self._sure = [bytearray(1 if v >= MIN_HITS else 0 for v in row)
+                                  for row in self._hits]
                 self.objects = data.get('objects', [])
+                # Entries written before objects were placed carry no wx/wy;
+                # they would fail a place match forever and multiply, so the
+                # first view of each of them re-places it through _fuse_object_locked.
+                for obj in self.objects:
+                    obj.setdefault('wx', None)
+                    obj.setdefault('wy', None)
                 pose = data.get('pose')
                 if isinstance(pose, list) and len(pose) == 3:
                     self.pose = (float(pose[0]), float(pose[1]), float(pose[2]))
@@ -471,8 +646,9 @@ class SpatialMemory:
         try:
             with self._lock:
                 payload = {'version': MEM_VERSION, 'grid': self._hits,
-                           'free': self._free, 'objects': self.objects,
-                           'pose': list(self.pose)}
+                           'free': self._free,
+                           'sure': [list(row) for row in self._sure],
+                           'objects': self.objects, 'pose': list(self.pose)}
             tmp = self.path + '.tmp'
             with open(tmp, 'w', encoding='utf-8') as fh:
                 json.dump(payload, fh)
@@ -489,6 +665,8 @@ class SpatialMemory:
             self._hits = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
             self._free = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
             self._last = [[0.0] * GRID_SIZE for _ in range(GRID_SIZE)]
+            self._sure = [bytearray(GRID_SIZE) for _ in range(GRID_SIZE)]
+            self._covered = [bytearray(GRID_SIZE) for _ in range(GRID_SIZE)]
             self.objects = []
             self.pose = (0.0, 0.0, 0.0)
             self.motion, self.motion_m = 'unknown', 0.0

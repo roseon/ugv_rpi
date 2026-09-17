@@ -29,6 +29,7 @@ import types
 
 import lance
 import perception
+import robot_state
 import spatial_memory
 import target_pursuit
 from detection_source import DetectionSource
@@ -45,10 +46,17 @@ def check(name, cond, detail=""):
 
 
 class RL:
-    def __init__(self, angles, dists, stamp=None):
+    def __init__(self, angles, dists, stamp=None, bin_age_s=0.0):
         self.lidar_angles_show = angles
         self.lidar_distances_show = dists
         self.lidar_scan_time = stamp   # moves once per revolution, like the real one
+        # base_ctrl's 1-degree occupancy bins, indexed exactly as the parser
+        # builds them: with the sensor mount's +180 baked in, stamped as filled.
+        self.lidar_bins = [(0.0, 0.0) for _ in range(360)]
+        for a, d in zip(angles, dists):
+            if d > 0:
+                self.lidar_bins[int(round(math.degrees(a))) % 360] = (
+                    float(d), time.time() - bin_age_s)
 
 
 class Base:
@@ -317,10 +325,10 @@ st = drv.status()
 check("keys identical",
       set(st) == {'active', 'suggested_turn', 'front_mm', 'halt', 'wheels',
                   'decision', 'busy_cells', 'free_cells', 'objects', 'scores',
-                  'target', 'map'},
+                  'target', 'map', 'course_deg', 'covered_cells'},
       sorted(st))
-check("wheels read from the ESP32 frame", st['wheels'] ==
-      {'odl': -10398.7, 'odr': -9916.4, 'voltage': 11.48})
+check("wheels read from the ESP32 frame, forward positive", st['wheels'] ==
+      {'odl': 10398.7, 'odr': 9916.4, 'voltage': 11.48})
 check("no target -> target is null", st['target'] is None)
 check("the map reports its own frame", st['map']['pose'] == [0.0, 0.0, 0.0]
       and st['map']['motion'] in ('unknown', 'none', 'waiting', 'unchecked',
@@ -450,9 +458,11 @@ check("an object disk also saturates at HIT_MAX, not 65535",
 for _ in range(spatial_memory.HIT_MAX + 2):
     ocs._decay_locked(time.time() + 3600)
 peak_after = max(h for row in ocs._hits for h in row)
-check("an unobserved object disk stops blocking, keeping only the memory of it",
-      peak_after == spatial_memory.MEM_FLOOR and not ocs.blocked(0.0, 1.0),
-      peak_after)
+# An object is a claim about where something is now, not a place: nothing the
+# LIDAR ever confirmed, so once the camera stops reporting it there is nothing
+# to keep and it decays away entirely rather than lingering at the floor.
+check("an unobserved object disk decays away instead of lingering",
+      peak_after == 0 and not ocs.blocked(0.0, 1.0), peak_after)
 
 # ── 6. pursuit: aim, smoothness, arrival, search, veto ──────
 print("--- 6. pursuit behaviors ---")
@@ -615,6 +625,307 @@ check("detections fused into memory with + bearing (left object)",
       mem3.objects and mem3.objects[0]['bearing_deg'] > 0 and
       mem3.objects[0]['name'] == 'chair', mem3.objects[:1])
 drv.stop()
+
+# ── 7b. the planner's object view does not wait for the CV overlay ──────────
+# Live, the camera saw a surfboard while the map held 0 objects: the only stream
+# the planner read was cvf.last_detections, which the CV overlay refreshes while
+# it happens to be in one of its object modes.  The gaze already runs the shared
+# detector while the eyes are on, so it is read first.
+print("--- 7b. detections: the gaze's own camera pass reaches the planner ---")
+
+
+class Gaze:
+    """A gaze status, shaped the way eyes_gaze.status() publishes it."""
+
+    def __init__(self, dets=None, enabled=True, stale=False, age=0.2):
+        self._status = {'enabled': enabled, 'frame_stale': stale, 'age_s': age,
+                        'detections': dets or []}
+
+    def status(self):
+        return dict(self._status)
+
+
+# Boxes are fractions of the frame: 0.75-0.95 is the right third of it.
+person_box = [{'name': 'person', 'conf': 0.81, 'person': True,
+               'box': [0.75, 0.30, 0.95, 0.85]}]
+cv_off = CV()                                # overlay off: it has no hits
+src = DetectionSource(cv_off, gaze=Gaze(person_box))
+dets = src.live()
+check("a person reaches the planner with the CV overlay off (the overlay gate)",
+      len(dets) == 1 and dets[0]['name'] == 'person', dets)
+check("...with the gaze's fraction-of-frame box scaled into the map's terms",
+      dets[0]['box'] == [480, 144, 608, 408]
+      and -25.0 < perception.box_bearing_deg(dets[0]['box']) < -17.0,
+      dets[0]['box'])
+
+mem_g = spatial_memory.SpatialMemory()
+mem_g.observe_detections(dets, 1.5)
+check("one sighting remembers the object",
+      len(mem_g.objects) == 1 and mem_g.objects[0]['name'] == 'person'
+      and mem_g.objects[0]['bearing_deg'] < 0, mem_g.objects[:1])
+mem_g.observe_detections(src.live(), 1.5)    # seen again, as the app keeps doing
+mem_g.observe_detections(src.live(), 1.5)
+check("...and once seen twice, that heading is refused",
+      mem_g.clearance(math.radians(-21.0), 1.5) < 1.0,
+      mem_g.clearance(math.radians(-21.0), 1.5))
+
+# Staleness: only a gaze that is running and whose camera is answering speaks
+# for the planner.  A slower, intermittent source must not be read as current.
+check("a gaze whose loop has stopped stepping feeds the planner nothing",
+      DetectionSource(cv_off, gaze=Gaze(person_box, age=30.0)).live() == [])
+check("a switched-off gaze feeds the planner nothing",
+      DetectionSource(cv_off, gaze=Gaze(person_box, enabled=False)).live() == [])
+check("a gaze with a frozen camera frame feeds the planner nothing",
+      DetectionSource(cv_off, gaze=Gaze(person_box, stale=True)).live() == [])
+check("no gaze at all leaves the overlay stream as the only source",
+      DetectionSource(cv_off).live() == [])
+
+# Two paths reporting one chair must stay one chair.  Nothing is merged in
+# DetectionSource: the memory's own name/bearing/range dedupe is the only one.
+overlay_chair = [{'name': 'chair', 'confidence': 0.7, 'box': [280, 100, 360, 300]}]
+gaze_chair = [{'name': 'chair', 'conf': 0.9, 'person': False,
+               'box': [0.44, 0.21, 0.56, 0.63]}]
+mem_b = spatial_memory.SpatialMemory()
+mem_b.observe_detections(
+    DetectionSource(CV(overlay_chair), gaze=Gaze(gaze_chair)).live(), 1.5)
+check("the same chair from both streams is one object",
+      len(mem_b.objects) == 1, mem_b.objects)
+
+# Where things are *now*: a person crossing the frame must stop refusing the
+# heading they were last seen at, and must not leave a fence of disks behind.
+moving = DetectionSource(cv_off, gaze=Gaze(person_box))
+mem_m = spatial_memory.SpatialMemory()
+for _ in range(3):
+    mem_m.observe_detections(moving.live(), 1.5)
+before = mem_m.clearance(math.radians(-21.0), 1.5)
+moving.gaze = Gaze([{'name': 'person', 'conf': 0.81, 'person': True,
+                     'box': [0.05, 0.30, 0.25, 0.85]}])
+for _ in range(3):
+    mem_m.observe_detections(moving.live(), 1.5)
+check("a person who walks across the frame stops refusing the old heading",
+      before < 1.0 and mem_m.clearance(math.radians(-21.0), 1.5) == 1.0,
+      "%s -> %s" % (before, mem_m.clearance(math.radians(-21.0), 1.5)))
+check("...and the heading they are at now is the refused one",
+      mem_m.clearance(math.radians(21.0), 1.5) < 1.0,
+      mem_m.clearance(math.radians(21.0), 1.5))
+# An empty batch (nothing in view) releases the disk the same way.
+for _ in range(3):
+    mem_m.observe_detections([], 1.5)
+check("nothing in view releases every object cell",
+      mem_m.clearance(math.radians(21.0), 1.5) == 1.0,
+      mem_m.clearance(math.radians(21.0), 1.5))
+
+# ...but a cell the LIDAR has confirmed is a *place*: a person standing in front
+# of a wall must not erase the wall by walking away, or a room with people in it
+# would churn the map every camera pass.
+mem_s = spatial_memory.SpatialMemory()
+angles, dists = scan(front_mm=1500)
+for _ in range(3):
+    mem_s.observe_lidar([perception.robot_angle(a) for a in angles], dists)
+check("three scans of a wall 1.5 m ahead block the cell",
+      mem_s.blocked(0.0, 1.5), mem_s.pose_status())
+spot = mem_s._disk_cells(0.0, 1.5)
+check("a person dead ahead covers LIDAR-confirmed cells (the case this pins)",
+      bool(spot) and any(mem_s._sure[c][r] for c, r in spot), spot[:3])
+mem_s.observe_detections([{'name': 'person', 'confidence': 0.9,
+                           'box': [280, 100, 360, 300]}], 1.5)
+mem_s.observe_detections([], 1.5)            # they walked away
+kept = [mem_s._sure[c][r] for c, r in spot if mem_s._sure[c][r]]
+check("...walking away leaves the wall's place intact, not erased",
+      bool(kept) and max(mem_s._hits[c][r] for c, r in spot)
+      >= spatial_memory.MEM_FLOOR, kept[:3])
+for _ in range(3):                           # a few more revolutions
+    mem_s.observe_lidar([perception.robot_angle(a) for a in angles], dists)
+check("...and the LIDAR has its blocking back within three revolutions",
+      mem_s.blocked(0.0, 1.5), [(c, r, mem_s._hits[c][r]) for c, r in spot[:3]])
+
+# The wiring, not just the class: app.py builds the gaze *after* the planner, so
+# a dropped line here would put the object path back behind the overlay gate.
+with open("app.py", encoding="utf-8") as fh:
+    app_tree = ast.parse(fh.read(), filename="app.py")
+
+
+def _dotted(node):
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    return ".".join(reversed(parts + [getattr(node, "id", "")]))
+
+
+check("app.py attaches the gaze to the planner's detection source",
+      any(isinstance(n, ast.Assign)
+          and any(_dotted(t) == "self_driver.detections.gaze" for t in n.targets)
+          for n in ast.walk(app_tree)))
+
+# ── 7c. a detection is ranged where the LIDAR actually sees it ────────────
+# Every detection used to be given the front cone's range, so an object 30 deg
+# off to the side was stored at whatever was nearest straight ahead: live, one
+# `oven` was held twice at the same bearing 0.46 m and 1.7 m apart, and a view
+# of a handful of things produced 20 entries.
+print("--- 7c. detections are ranged at their own bearing ---")
+
+# The room: 1.0 m straight ahead, a wall 2.5 m away across +20..+40 deg.  The
+# box is the left edge of the frame, which is that bearing.
+side_det = [{"name": "chair", "confidence": 0.9, "box": [0, 100, 60, 300]}]
+side_deg = perception.box_bearing_deg(side_det[0]["box"])
+check("the side detection's own bearing is where the wall is (+27 deg)",
+      25.0 < side_deg < 29.0, side_deg)
+
+side_room = scan(front_mm=1000, sectors={d: 2500 for d in range(20, 41)})
+drv, _ = planner(side_room, dets=side_det)
+ticking(drv)
+drv._tick()
+obj = drv.memory.objects[0]
+check("a detection 27 deg to the side is stored 2.5 m away, not the front's 1.0",
+      len(drv.memory.objects) == 1 and 2.4 <= obj["range_m"] <= 2.6
+      and obj["bearing_deg"] > 25.0, obj)
+drv.stop()
+
+# The look is as wide as the box, so a box only a few pixels wide still finds
+# beams (the sensor samples about every 2 deg of turn).
+thin_det = [{"name": "chair", "confidence": 0.9, "box": [10, 100, 26, 300]}]
+drv, _ = planner(side_room, dets=thin_det)
+ticking(drv)
+drv._tick()
+check("...and a box a few pixels wide finds them too",
+      2.4 <= drv.memory.objects[0]["range_m"] <= 2.6, drv.memory.objects[0])
+drv.stop()
+
+# No return in the sector the camera can see: the front cone stays the honest
+# fallback rather than a made-up distance.  (The bins are what a detection is
+# ranged from, because the single revolution arrives in patches where the near
+# return never came: live, that placed objects up to 2.5 m too far.)
+gap_room = scan(front_mm=1000, sectors={d: 0 for d in range(15, 40)})
+check("a sector with no usable return answers None, not a distance",
+      robot_state.dense_sector_min_mm(Base(RL(*gap_room)), side_deg, 5.0) is None,
+      robot_state.dense_sector_min_mm(Base(RL(*gap_room)), side_deg, 5.0))
+drv, _ = planner(gap_room, dets=side_det)
+ticking(drv)
+drv._tick()
+check("...so that detection keeps the front range",
+      0.9 <= drv.memory.objects[0]["range_m"] <= 1.1, drv.memory.objects[0])
+drv.stop()
+
+# The LIDAR's own frame, not a mirrored one: a wall on the other side of the
+# robot must not range this detection.
+wrong_side = scan(front_mm=1000, sectors={d: 2500 for d in range(-33, -22)})
+drv, _ = planner(wrong_side, dets=side_det)
+ticking(drv)
+drv._tick()
+check("a wall on the other side is not used for it (the frame sign holds)",
+      0.9 <= drv.memory.objects[0]["range_m"] <= 1.1, drv.memory.objects[0])
+drv.stop()
+
+# A bin nobody filled recently says nothing about where anything is now.
+stale_room = scan(front_mm=1000, sectors={d: 2500 for d in range(20, 41)})
+drv, _ = planner(stale_room, dets=side_det)
+ticking(drv)
+drv._base.rl.lidar_bins = [(d, t - 30.0) for d, t in drv._base.rl.lidar_bins]
+drv._tick()
+check("a stale bin is not believed (the front range is used instead)",
+      0.9 <= drv.memory.objects[0]["range_m"] <= 1.1, drv.memory.objects[0])
+drv.stop()
+
+# Why the object list used to hold the same thing twice: the range moved with
+# the robot's view, and two sightings more than OBJ_DEDUPE_M apart are two
+# objects.  Seen twice with the front range changing, one object still.
+near_det = [{"name": "oven", "confidence": 0.6, "box": [0, 100, 60, 300]}]
+room_a = scan(front_mm=1000, sectors={d: 2500 for d in range(20, 41)})
+room_b = scan(front_mm=460, sectors={d: 2500 for d in range(20, 41)})
+drv, _ = planner(room_a, dets=near_det)
+ticking(drv)
+drv._tick()
+drv._base.rl = RL(*room_b)                    # it drove on: the front range moved
+drv._tick()
+check("one object seen twice, with the front range moving, stays one object",
+      len(drv.memory.objects) == 1, drv.memory.objects)
+check("...and it is still stored at the wall's range both times",
+      all(2.4 <= o["range_m"] <= 2.6 for o in drv.memory.objects),
+      drv.memory.objects)
+# ...which is what the front-only range could not do, and the failure this pins.
+mem_near = spatial_memory.SpatialMemory()
+mem_near.observe_detections(near_det, 1.7)
+mem_near.observe_detections(near_det, 0.46)
+check("the live failure itself: the front-only ranges split one object in two",
+      len(mem_near.objects) == 2, mem_near.objects)
+drv.stop()
+
+# One chair, seen from two viewpoints, is one object.  Matching on the bearing
+# alone is what turned a room holding a handful of things into 133 entries: as
+# the robot turned, the same chair kept reappearing at a new bearing.
+mem_place = spatial_memory.SpatialMemory()
+mem_place.observe_detections([{"name": "chair", "confidence": 0.9,
+                               "box": [0, 100, 60, 300]}], 2.0)      # +27 deg, 2.0 m
+mem_place.pose = (1.0, 1.0, 0.0)                # it drove 1 m left and 1 m on
+# ...so that same place is now 0.78 m away at -6.3 deg, seen through the box
+# that points there.
+mem_place.observe_detections([{"name": "chair", "confidence": 0.9,
+                               "box": [327, 100, 447, 300]}], 0.78)
+check("one chair from two viewpoints is one object, at its newest bearing",
+      len(mem_place.objects) == 1 and -8.0 < mem_place.objects[0]["bearing_deg"] < -4.0,
+      mem_place.objects)
+# ...while two chairs in different places stay two objects.
+mem_two = spatial_memory.SpatialMemory()
+chair_box = [280, 100, 360, 300]                # dead ahead
+mem_two.observe_detections([{"name": "chair", "confidence": 0.9,
+                             "box": chair_box}], 1.0)
+mem_two.observe_detections([{"name": "chair", "confidence": 0.9,
+                             "box": chair_box}], 2.0)
+check("two chairs a metre apart stay two objects",
+      len(mem_two.objects) == 2, mem_two.objects)
+
+# An entry is a claim about *now*, same as its cells: one no batch refreshes
+# within OBJ_TTL_S is dropped.  Without this the list grew without bound --
+# 268 entries live for a room holding a handful of things -- and the map file
+# reloaded the ghosts into every later session.
+mem_ttl = spatial_memory.SpatialMemory()
+mem_ttl.observe_detections([{"name": "chair", "confidence": 0.9,
+                             "box": [280, 100, 360, 300]}], 1.0)
+check("a fresh entry is kept",
+      len(mem_ttl.objects) == 1, mem_ttl.objects)
+old = time.time() - (spatial_memory.OBJ_TTL_S + 5.0)
+for o in mem_ttl.objects:
+    o['t'] = old
+mem_ttl.observe_detections([{"name": "tv", "confidence": 0.9,
+                             "box": [0, 100, 40, 300]}], 1.5)     # a different bearing
+check("an entry no batch has refreshed for OBJ_TTL_S is dropped",
+      len(mem_ttl.objects) == 1 and mem_ttl.objects[0]['name'] == 'tv',
+      mem_ttl.objects)
+mem_keep = spatial_memory.SpatialMemory()
+mem_keep.observe_detections([{"name": "chair", "confidence": 0.9,
+                              "box": [280, 100, 360, 300]}], 1.0)
+for o in mem_keep.objects:
+    o['t'] = old
+mem_keep.observe_detections([{"name": "chair", "confidence": 0.9,
+                              "box": [280, 100, 360, 300]}], 1.0)   # same place, re-seen
+check("an entry the camera still sees is refreshed, not dropped",
+      len(mem_keep.objects) == 1
+      and mem_keep.objects[0]['t'] > time.time() - spatial_memory.OBJ_TTL_S,
+      mem_keep.objects)
+
+# ...and a map file written before objects were placed must not multiply either:
+# its entries re-place themselves the first time the camera sees them again.
+probe = os.path.join(tempfile.gettempdir(), "_sd_selftest_place.json")
+if os.path.exists(probe):
+    os.remove(probe)
+mem_p = spatial_memory.SpatialMemory(path=probe)
+mem_p.observe_detections([{"name": "oven", "confidence": 0.6,
+                           "box": [280, 100, 360, 300]}], 1.0)
+mem_p.save()
+with open(probe, encoding="utf-8") as fh:
+    payload = json.load(fh)
+for obj in payload['objects']:
+    obj.pop('wx', None); obj.pop('wy', None)
+with open(probe, "w", encoding="utf-8") as fh:
+    json.dump(payload, fh)
+mem_q = spatial_memory.SpatialMemory(path=probe)
+os.remove(probe)
+mem_q.observe_detections([{"name": "oven", "confidence": 0.6,
+                           "box": [280, 100, 360, 300]}], 1.0)
+check("a pre-place map entry re-places itself instead of multiplying",
+      len(mem_q.objects) == 1 and mem_q.objects[0].get('wx') is not None,
+      mem_q.objects)
 
 # ── 8. memory: ownership, versioning, planner shortcuts ────────────────────
 print("--- 8. memory ---")
@@ -820,8 +1131,10 @@ check("a scan already folded in is not counted again", mem9.busy_cells == once,
 # decided by MIN_HITS of recent evidence, so a cell the robot has stopped seeing
 # is remembered without being able to refuse a heading.  Decay is driven past
 # the horizon here rather than slept through.
+# Three revolutions, because the floor is for cells that reached MIN_HITS: one
+# sighting is not evidence of a surface (see the stray-return check below).
 memF = spatial_memory.SpatialMemory()
-for sid in (401, 402):
+for sid in (401, 402, 403):
     memF.observe_lidar(ANG, cast((0.0, 0.0, 0.0), ANG), odom=None, scan_id=sid)
 seen = memF.busy_cells
 check("a wall 2 m ahead blocks while it is being seen",
@@ -835,6 +1148,32 @@ check("...but stale evidence cannot refuse a heading any more",
       not memF.blocked(0.0, 2.0))
 check("...and the cells are held at the floor, not decaying away",
       all(h == spatial_memory.MEM_FLOOR for _x, _y, h in memF.cells(min_hits=1)))
+
+# A stray return is not a surface.  Measured on the robot: 7,380 of 12,449
+# remembered cells sat at one hit with a median distance of 5.88 m — noise at the
+# edge of the sensor's range — and 86% of everything remembered beyond 5.5 m was
+# that noise, while 97% of the cells within 2 m had been confirmed.  One
+# sighting must therefore decay away, and a confirmed cell must not.
+memN = spatial_memory.SpatialMemory()
+memN.observe_lidar(ANG, cast((0.0, 0.0, 0.0), ANG), odom=None, scan_id=501)
+near = memN._cell(0.0, 2.0)
+far = memN._cell(0.0, 5.5)
+# A surface inside about two metres puts several rays in one cell per revolution
+# (3 deg at 1.9 m is 0.1 m), so the wall the robot is looking at is confirmed by
+# that single sweep; at 5.5 m the rays are 0.29 m apart, one per cell, which is
+# why the far half of a real map is single-hit noise.
+check("a wall close enough to return several rays is confirmed at once",
+      memN._hits[near[0]][near[1]] >= spatial_memory.MIN_HITS,
+      memN._hits[near[0]][near[1]])
+memN._hits[far[0]][far[1]] = 1
+memN._last[far[0]][far[1]] = time.time()
+for i in range(20):
+    memN._decay_locked(future + i * (spatial_memory.DECAY_SEC + 1))
+check("a single stray return does not become a remembered cell",
+      memN._hits[far[0]][far[1]] == 0, memN._hits[far[0]][far[1]])
+check("...while the surface it did confirm is kept, remembered not blocking",
+      memN._hits[near[0]][near[1]] == spatial_memory.MEM_FLOOR
+      and not memN.blocked(0.0, 2.0))
 
 # the map steers: a remembered wall refuses the heading into it, and a map that
 # refuses everything falls back to what the live scan says
@@ -870,7 +1209,7 @@ drv9._tick()                                   # establishes the odometer's orig
 check("no travel yet -> the map has not been told to move",
       drv9.memory.pose == (0.0, 0.0, 0.0), drv9.memory.pose_status())
 drv9._base.rl = RL(ANG, cast((0.0, 1.0, 0.0), ANG), 22.0)
-drv9._base.base_data = {'odl': 1.0, 'odr': 1.0}
+drv9._base.base_data = {'odl': -1.0, 'odr': -1.0}   # raw counts down going forward
 drv9._tick()
 check("the planner hands the wheel travel and the scan stamp to the map",
       drv9.memory.motion == 'accepted' and abs(drv9.memory.pose[1] - 1.0) < 0.05,
@@ -902,10 +1241,110 @@ drv11.disable()                                # what the /selfdrive route does
 check("self-drive off still tears the planner down", drv11._thread is None
       and drv11._sampler is not None and drv11._sampler.is_alive())
 drv11._base.rl = RL(ANG, cast((0.0, 1.0, 0.0), ANG), 42.0)
-drv11._base.base_data = {'odl': 1.0, 'odr': 1.0}   # driven by hand, off self-drive
+drv11._base.base_data = {'odl': -1.0, 'odr': -1.0}   # raw counts down going forward
 time.sleep(0.8)
 check("...and it follows the robot while a person drives it",
       drv11.memory.pose[1] > 0.9, drv11.memory.pose_status())
+
+
+if FAILS:
+    print("FAILED: " + ", ".join(FAILS))
+    raise SystemExit(1)
+print("ALL PROBES PASSED")
+# which the fit guard rightly demands.
+print("--- 7d. course-keeping cruise ---")
+sm_pose_step = perception.pose_step             # the room scenarios move their own pose
+ROOM_COURSE = (-3.0, 6.0, -3.0, 6.0)            # a room big enough to drive along +y
+mem_course = spatial_memory.SpatialMemory()
+pose = (0.0, 0.0, 0.0)                          # facing +y (map), robot frame 0
+drv_course, _ = planner(mem=mem_course,
+                        base_data={'odl': 0.0, 'odr': 0.0})
+ticking(drv_course)
+drv_course._base.rl = RL(ANG, cast(pose, ANG, ROOM_COURSE), 21.0)
+drv_course._base.base_data = {'odl': 0.0, 'odr': 0.0}
+drv_course._tick()                              # odometer origin
+for i in range(1, 6):                           # drive 0.5 m along +y, through the driver
+    pose = sm_pose_step(pose, 0.10, 0.10)
+    drv_course._base.rl = RL(ANG, cast(pose, ANG, ROOM_COURSE),
+                             21.0 + i)
+    drv_course._base.base_data = {'odl': -i * 0.10, 'odr': -i * 0.10}
+    drv_course._tick()
+check("the course is the direction of recent travel",
+      drv_course._course_map is not None and abs(drv_course._course_map - 0.0) < 12.0,
+      (drv_course._course_map, mem_course.pose))
+check("...and with everything clear, cruise keeps that course",
+      abs(drv_course.suggested_turn) < 0.05,
+      (drv_course.suggested_turn, drv_course.last_decision))
+drv_course.stop()
+
+# A pivot leaves the course alone: only translation rewrites it.  The wheels
+# report a spin, the room agrees the robot only turned, and the course's map
+# bearing survives — one drive after the pivot re-affirms it.
+mem_turn = spatial_memory.SpatialMemory()
+pose = (0.0, 0.0, 0.0)
+drv_turn, _ = planner(mem=mem_turn, base_data={'odl': 0.0, 'odr': 0.0})
+ticking(drv_turn)
+drv_turn._base.rl = RL(ANG, cast(pose, ANG, ROOM_COURSE), 31.0)
+drv_turn._base.base_data = {'odl': 0.0, 'odr': 0.0}
+drv_turn._tick()
+for i in range(1, 5):                           # drive 0.4 m to set a course
+    pose = sm_pose_step(pose, 0.10, 0.10)
+    drv_turn._base.rl = RL(ANG, cast(pose, ANG, ROOM_COURSE), 31.0 + i)
+    drv_turn._base.base_data = {'odl': -i * 0.10, 'odr': -i * 0.10}
+    drv_turn._tick()
+before = drv_turn._course_map
+spin = 0.25 * perception.TRACK_M / 2.0          # wheels for a ~29 deg pivot
+pose = sm_pose_step(pose, -spin, spin)
+drv_turn._base.rl = RL(ANG, cast(pose, ANG, ROOM_COURSE), 40.0)
+drv_turn._base.base_data = {'odl': -4 * 0.10 + spin, 'odr': -4 * 0.10 - spin}
+drv_turn._tick()                                # the pivot: no translation
+check("a pivot does not rewrite the course",
+      drv_turn._course_map == before and before is not None,
+      (before, drv_turn._course_map, mem_turn.pose))
+drv_turn.stop()
+
+# The novelty term pulls toward unmapped floor — gently, and only at equal
+# clearance: two headings equally clear, one mapped and one unknown, must not
+# score the same, and neither may the term ever outrank safety.
+print("--- 7e. novelty pulls toward unmapped floor ---")
+# One room, one scan: the +30 deg cone sees a wall 3 m away (its floor maps
+# free), the -30 deg cone returns nothing at all — no-return rays leave floor
+# unmapped.  The two headings are then equally clear but not equally known,
+# which is exactly the tie the novelty term exists to break.
+nov_angles = [raw(d) for d in range(-180, 180)]
+nov_dists = [0.0] * 360                    # unknown side: no return
+for d in range(10, 61):                    # known side: wall at 3 m
+    nov_dists[d + 180] = 3000.0
+mem_nov = spatial_memory.SpatialMemory()
+mem_nov.observe_lidar([perception.robot_angle(a) for a in nov_angles],
+                      nov_dists, odom=None, scan_id=1)
+check("novelty reads the mapped side as known, the other as unknown",
+      mem_nov.novelty(math.radians(30)) < 0.2
+      and mem_nov.novelty(math.radians(-30)) > 0.5,
+      (mem_nov.novelty(math.radians(30)), mem_nov.novelty(math.radians(-30))))
+drv, _ = planner(scan_pair=(nov_angles, nov_dists), mem=mem_nov)
+ticking(drv)
+drv._tick()
+nov_scores = dict(drv.last_scores)
+check("unmapped side outscores the mapped side at equal clearance",
+      (nov_scores.get(-30) or -9) > (nov_scores.get(30) or -9), nov_scores)
+drv.stop()
+
+# Coverage: the floor the robot has driven over is recorded, and the count
+# grows as it moves — the Roomba metric, one number.
+print("--- 7f. covered floor ---")
+mem_cov = spatial_memory.SpatialMemory()
+check("a robot that never moved has covered nothing", mem_cov.covered_cells == 0)
+pose = (0.0, 0.0, 0.0)
+mem_cov.observe_lidar(ANG, cast(pose, ANG), odom=None, scan_id=1)
+first = mem_cov.covered_cells
+check("standing still covers the disk around the robot", first > 0, first)
+for sid in range(2, 7):                          # drive half a metre
+    mem_cov.observe_lidar(ANG, cast(pose, ANG), odom=(0.10, 0.10), scan_id=sid)
+    pose = sm_pose_step(pose, 0.10, 0.10)
+after = mem_cov.covered_cells
+check("driving on covers more floor than standing still", after > first,
+      (first, after))
 
 print()
 print("RESULT: %d failures" % len(FAILS))

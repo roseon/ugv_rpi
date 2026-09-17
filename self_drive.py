@@ -35,9 +35,10 @@ import threading
 import time
 
 from detection_source import DetectionSource
-from perception import arc_clearance
-from robot_state import LidarScan, WheelStep, wheel_odometry
-from spatial_memory import MEM_VERSION, SpatialMemory          # re-exported
+from perception import arc_clearance, box_span_deg
+from robot_state import (LidarScan, WheelStep, dense_sector_min_mm,
+                         wheel_odometry)
+from spatial_memory import MEM_VERSION, OBJ_RANGE_MAX, SpatialMemory   # re-exported
 from target_pursuit import PursuitPolicy, Target
 
 # ── planner tunables ──────────────────────────────────────────────────────────
@@ -47,6 +48,9 @@ SAVE_INTERVAL = 60.0        # seconds between auto-saves while active
 TOO_CLOSE_MM  = 250         # inside this the planner refuses to drive forward
 FRONT_CONE_DEG = 45         # safety cone for TOO_CLOSE_MM
 OBJECT_CONE_DEG = 35       # front sector a detection is ranged with for memory
+OBJECT_HALF_MIN_DEG = 5    # ...and how wide the look at a detection's own
+OBJECT_HALF_MAX_DEG = 20   #    bearing is, at least and at most (see
+                           #    _detection_range: the sensor samples ~2°)
                            # (the *arrival* range follows the object's own
                            # bearing — see target_pursuit.TARGET_CONE_DEG)
 VETO_HALF_WIDTH = 0.4      # rad — live arc sampled per candidate heading
@@ -55,8 +59,21 @@ VETO_HALF_WIDTH = 0.4      # rad — live arc sampled per candidate heading
 W_LIDAR = 2.0
 W_MEM   = 1.2
 W_GOAL  = 0.6
+W_NOVEL = 0.5             # gentle pull toward unmapped floor: enough to break a
+                          # tie between two clear headings, never enough to beat
+                          # a heading that is actually safer (clearance weighs 2.0)
 MEM_RADII = (0.55, 1.1)  # metres — remembered occupancy is sampled near and far
 MEM_BLOCK_CLEAR = 0.34   # below this fraction of a near arc the heading is refused
+
+# Roomba-style course keeping: the cruise goal is no longer "whatever is
+# straight ahead of the bumper" but "the direction I have been driving".
+# Without it every local block swung the robot toward the widest gap anywhere
+# in the room — headings of +-80 and even +-110 deg chosen while cruising,
+# pirouetting in place instead of covering floor.  With it the robot turns the
+# minimum a block demands, then carries on along its old line.
+COURSE_HOLD_S = 6.0       # a course older than this is stale and re-established
+COURSE_BIAS   = 1.0       # weight of the held course inside the goal term
+COURSE_MAX_DEG = 90.0     # beyond this from the held course the bias falls off
 
 # ── what the learned map is for ──────────────────────────────────────────────
 # The grid is place-referenced now, which is what makes it worth driving on: a
@@ -123,6 +140,9 @@ class SelfDriver:
         self.last_scores = []       # [(deg, score)] for the UI
         self.last_decision = "off"
         self._heading_smooth = 0.0  # EMA of the chosen heading, in degrees
+        self._course_map = None     # map-frame bearing of recent actual travel
+        self._course_t = 0.0        # ...and when that was last confirmed
+        self._last_course_xy = None # the pose the course was last read from
         self._learned = False       # something new since the last save
         self._sampler = None        # the thread that keeps the map current
         self._sampler_stop = threading.Event()
@@ -184,6 +204,7 @@ class SelfDriver:
         self.halt = False
         self.last_decision = "off"
         self._heading_smooth = 0.0
+        self._course_map = None
         self._stop_evt.set()
         thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
@@ -196,6 +217,7 @@ class SelfDriver:
         self.halt = False
         self.last_decision = "paused"
         self._heading_smooth = 0.0
+        self._course_map = None
         if save:
             self.memory.save()
 
@@ -267,6 +289,9 @@ class SelfDriver:
             'scores': self.last_scores,
             'target': self.target.status(),
             'map': self.memory.pose_status(),
+            'course_deg': (None if self._course_map is None
+                           else round(self._course_map, 1)),
+            'covered_cells': self.memory.covered_cells,
         }
 
     # ── planning ──────────────────────────────────────────────────────────
@@ -281,6 +306,34 @@ class SelfDriver:
                     print(f"[planner] tick error: {e}")
             time.sleep(max(0.0, interval - (time.time() - t0)))
 
+    def _detection_range(self, scan):
+        """Where each detection really is: the LIDAR returns at its own bearing.
+
+        A camera box says where a thing is *sideways*; only the LIDAR says how
+        far it is.  One front cone was applied to every detection, so an object
+        30° off to the side was stored at whatever was nearest straight ahead —
+        live, one `oven` was held twice at the same bearing 0.46 m and 1.7 m
+        apart, and a view of a few things produced 20 entries.
+
+        The distance comes from the 1-degree occupancy bins rather than from the
+        one revolution `scan` holds: that revolution arrives in patches on this
+        kit's wire, and a hole in it answers with the room *behind* the thing
+        (measured live, objects landed up to 2.5 m beyond the sensor's own return
+        at their bearing).  The look at a detection's bearing is as wide as the
+        box is, so a small box still finds cells, and is clamped so a huge box
+        does not claim half the room.  Nothing fresh in that sector means the
+        front cone stays the honest fallback: the object is still recorded, just
+        not at a distance nothing measured.
+        """
+        def range_for(bearing_deg, box):
+            half_deg = max(OBJECT_HALF_MIN_DEG,
+                           min(OBJECT_HALF_MAX_DEG, box_span_deg(box) / 2.0))
+            mm = dense_sector_min_mm(self._base, bearing_deg, half_deg)
+            if not mm:
+                return None
+            return max(0.2, min(mm / 1000.0, OBJ_RANGE_MAX))
+        return range_for
+
     def _learn(self, scan):
         """Fold this scan (and the camera's view of it) into the learned map.
 
@@ -292,9 +345,36 @@ class SelfDriver:
                                   odom=self._wheels.step(self._base),
                                   scan_id=scan.stamp)
         dets = self.detections.for_target(self.target.name)
-        self.memory.observe_detections(dets, self._object_range_m(scan))
+        self.memory.observe_detections(dets, self._object_range_m(scan),
+                                       range_for=self._detection_range(scan))
         self._learned = True
+        self._course_from_pose()
         return dets
+
+    def _course_from_pose(self):
+        """The held course: the bearing of recent actual travel, or None.
+
+        Read from the map's pose (x left, y forward), not from wheel commands,
+        so a turn-in-place leaves it untouched and a block that turns the robot
+        does not lose the line it was driving.  Goes stale after
+        COURSE_HOLD_S of no travel so a pick-up-and-carry starts fresh.
+        """
+        pose = self.memory.pose_status().get('pose')
+        if not pose:
+            self._course_map = None
+            return
+        x, y, theta = pose[0], pose[1], pose[2]
+        if self._last_course_xy is not None:
+            dx, dy = x - self._last_course_xy[0], y - self._last_course_xy[1]
+            if math.hypot(dx, dy) >= 0.05:
+                # Map-frame bearing of the actual travel.  The robot frame it
+                # is steered in rotates with every pivot, so the conversion to
+                # a robot-frame heading happens at scoring time, not here.
+                self._course_map = math.degrees(math.atan2(dx, dy))
+                self._course_t = time.time()
+            elif time.time() - self._course_t > COURSE_HOLD_S:
+                self._course_map = None
+        self._last_course_xy = (x, y)
 
     def _learn_only(self):
         """Idle: keep learning the place from the LIDAR anyway.
@@ -307,6 +387,7 @@ class SelfDriver:
         scan = LidarScan.read(self._base)
         if not scan.empty:
             self._learn(scan)
+        self._course_from_pose()
 
     def _tick(self):
         """One planning step: read, learn, then decide (safety first)."""
@@ -363,7 +444,26 @@ class SelfDriver:
             mem_clear = min(near, self.memory.clearance(heading_rad, MEM_RADII[1]))
             goal_term = policy.goal_term(heading, bearing)
             if goal_term is None:
-                goal, weight = -abs(heading) / 180.0, W_GOAL  # prefer straight
+                # Cruise: keep the course the robot has been driving (Roomba's
+                # minimum-turn rule), pulled gently toward unmapped floor so
+                # open room gets covered instead of patrolled in circles.  The
+                # course is a map-frame bearing; it is re-expressed against the
+                # robot's current heading here, so a pivot rotates what "back
+                # on course" means instead of freezing it.
+                course = self._course_map
+                if course is not None:
+                    course = (course - math.degrees(self.memory.pose[2])
+                              + 180.0) % 360.0 - 180.0
+                novel = self.memory.novelty(heading_rad)
+                if course is None:
+                    goal, weight = (-abs(heading) / 180.0
+                                    + W_NOVEL / W_GOAL * novel, W_GOAL)
+                else:
+                    off = abs((heading - course + 180.0) % 360.0 - 180.0)
+                    keep = 1.0 - off / COURSE_MAX_DEG
+                    goal, weight = (max(-1.0, keep * COURSE_BIAS
+                                        - abs(heading) / 180.0 * 0.2)
+                                    + W_NOVEL / W_GOAL * novel, W_GOAL)
             else:
                 goal, weight = goal_term
             return (W_LIDAR * lidar_clear + W_MEM * mem_clear + weight * goal)

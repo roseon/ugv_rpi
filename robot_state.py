@@ -9,7 +9,49 @@ fresh list on every revolution, so every read snapshots it into a list before
 use — the planner must not walk a list that is being replaced underneath it.
 """
 
-from perception import POSE_MAX_STEP_M, front_min_mm, robot_angle
+import math
+import time
+
+from perception import (POSE_MAX_STEP_M, front_min_mm, robot_angle, sector_min)
+
+# A bin this old says nothing about where anything is now (base_ctrl stamps each
+# 1-degree cell as it is filled, and /lidar_points serves the same 3 s window).
+DENSE_BIN_AGE_S = 3.0
+
+
+def dense_sector_min_mm(base, center_deg, half_deg, max_age_s=DENSE_BIN_AGE_S):
+    """Smallest fresh return in a sector, from the 1-degree occupancy bins.
+
+    `LidarScan` reads the last revolution, and this kit's marginal wire often
+    delivers it in patches: a sector can simply be a hole, where a far return
+    survives and the near one never arrived.  Asking that scan where a camera
+    box is therefore answers with the room behind the thing — measured live,
+    objects were placed up to 2.5 m beyond the sensor's own return at their
+    bearing.  The bins are built from every valid packet of the last few seconds
+    (`base_ctrl.lidar_data_recv`), are the dense picture the operator's radar is
+    drawn from, and are stamped, so a stale cell is skipped rather than trusted.
+
+    Returns mm, or None when the sector holds no fresh return — the caller's
+    own fallback is more honest than a distance nothing measured.
+    """
+    rl = getattr(base, 'rl', None)
+    bins = getattr(rl, 'lidar_bins', None)
+    if not bins:
+        return None
+    now = time.time()
+    angles, distances = [], []
+    for deg in range(int(math.ceil(center_deg - half_deg)),
+                     int(math.floor(center_deg + half_deg)) + 1):
+        # The bins are indexed the way base_ctrl parses the wire: with the +180
+        # the sensor's mount bakes in (perception.LIDAR_ANGLE_OFFSET).
+        dist, stamp = bins[int((deg + 180) % 360)]
+        if dist > 0 and now - stamp <= max_age_s:
+            angles.append(math.radians(deg))
+            distances.append(dist)
+    if not angles:
+        return None
+    best = sector_min(angles, distances, center_deg, half_deg)
+    return None if best == float('inf') else best
 
 
 class LidarScan:
@@ -52,18 +94,29 @@ class LidarScan:
 
 
 def wheel_odometry(base):
-    """Latest ESP32 wheel odometer counters: signed travel per wheel, in metres.
+    """Latest ESP32 wheel odometer counters: signed travel per wheel, in metres,
+    with forward positive — the convention every consumer here assumes.
 
     The planner only suggests headings, so without these there is no way to
     tell "steering not delivered" from "chassis cannot move" — the counters
     changing is the only hard proof the wheels actually turned.
 
-    Measured on this robot to be metres of travel, not counts: 2.0 s commanded
-    at 0.30 came back as 0.589 m on the left and 0.588 on the right.
+    Magnitude measured on this robot: 2.0 s commanded at 0.30 came back as
+    0.589 m on the left and 0.588 on the right.  Direction measured live while
+    cruising forward on self-drive: both counters *decrease* (odl -1999.6 ->
+    -2144.6 over about 9 m of forward travel), so the chassis counts down
+    going forward.  The sign is flipped here, once, at the only place the raw
+    counters enter this code: fed through raw, the pose gate kept proposing a
+    backward move (motion_m negative) and the scan rightly rejected it —
+    13.5 m driven live, pose moved 0.000 m, the map learned nothing.
     """
     data = getattr(base, 'base_data', None) or {}
-    return {'odl': data.get('odl'), 'odr': data.get('odr'),
-            'voltage': data.get('v')}
+    odl, odr = data.get('odl'), data.get('odr')
+    if isinstance(odl, (int, float)):
+        odl = -float(odl)
+    if isinstance(odr, (int, float)):
+        odr = -float(odr)
+    return {'odl': odl, 'odr': odr, 'voltage': data.get('v')}
 
 
 class WheelStep:
