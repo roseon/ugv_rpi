@@ -147,7 +147,7 @@ if [ -z "$FILES" ]; then
   exit 1
 fi
 
-EXTRA=("face_screen.py" "start_face.sh")
+EXTRA=("face_screen.py" "start_face.sh" "wifi_default.py" "wifi_default.sh")
 for extra in "${EXTRA[@]}"; do
   [ -f "$extra" ] && FILES="$FILES
 $extra"

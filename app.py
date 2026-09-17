@@ -1259,6 +1259,26 @@ def speech_status():
     return jsonify(speech_face.FACE.snapshot())
 
 
+@app.route('/network_status')
+def network_status_route():
+    """The robot's Wi-Fi health and its watchdog's record, one payload.
+
+    The Command Center's header strip draws from this instead of the link
+    just going grey: is the wifi on the network, how strong, and — when it
+    has dropped before — what the wifi_default watchdog did about it (last
+    reconnects, reboots), and whether that watchdog is installed at all.
+    wifi_status owns the reading; this route only serves it.
+    """
+    try:
+        import wifi_status
+        return jsonify(wifi_status.snapshot())
+    except ImportError:
+        # This build predates the wifi_status module: say so rather than 404,
+        # so the UI can show "deploy to see wifi health" instead of a failure.
+        return jsonify({'connected': None, 'error': 'wifi_status not deployed'
+                        ' - run deploy.sh and wifi_default.sh --install'}), 200
+
+
 @app.route('/volume', methods=['GET', 'POST'])
 def volume_route():
     """The robot's output level (0..100) — what the Command Center slider drives.
