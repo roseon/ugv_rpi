@@ -94,7 +94,36 @@ def box_elevation_deg(box, frame_height=FRAME_HEIGHT_PX, frame_width=FRAME_WIDTH
     return (cy - 0.5) * v_fov_deg(frame_width, frame_height, h_fov_deg)
 
 
-# ── scan helpers (angles must already be in the robot frame) ──────────────────
+# ── scan helpers (angles must already be in the robot frame) ──────────────
+
+def side_wall(angles_rad, distances_mm, side, min_mm=150, max_mm=1300):
+    """The wall alongside the robot: range (m) and heading offset (rad), or None.
+
+    Reads the side sector (±15 deg around abeam at `side`·90°, + = left) and
+    picks the most abeam solid return within reach — the bearing a Roomba-like
+    follower actually steers against.  Positive heading offset means the nose
+    points TOWARD the wall (nearer ahead than behind); the range is the
+    standoff the follower holds.
+
+    Returns None when the side is open: too far to matter, or no solid return
+    (furniture gaps, sensor holes) — the caller then falls back to its other
+    anchors instead of steering against a wall it cannot see.
+    """
+    beam = side * math.pi / 2.0
+    lo = beam - math.radians(15.0)
+    hi = beam + math.radians(15.0)
+    best = None
+    best_abeam = 0.0
+    for a, d in zip(angles_rad, distances_mm):
+        if not (lo <= a <= hi) or not (min_mm <= d <= max_mm):
+            continue
+        abeam = math.cos(normalize_angle(a - beam))   # 1.0 exactly abeam
+        if abeam < best_abeam:
+            continue
+        best_abeam = abeam
+        best = (d / 1000.0, normalize_angle(a - beam))
+    return best
+
 
 def sector_min(angles_rad, distances_mm, center_deg, half_deg, min_mm=50):
     """Smallest valid distance (mm) inside an angular sector; inf = no reading."""

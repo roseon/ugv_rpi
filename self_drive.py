@@ -35,7 +35,7 @@ import threading
 import time
 
 from detection_source import DetectionSource
-from perception import arc_clearance, box_span_deg
+from perception import arc_clearance, box_span_deg, side_wall
 from robot_state import (LidarScan, WheelStep, dense_sector_min_mm,
                          wheel_odometry)
 from spatial_memory import MEM_VERSION, OBJ_RANGE_MAX, SpatialMemory   # re-exported
@@ -80,6 +80,32 @@ COURSE_BIAS   = 1.8       # weight of the held course inside the goal term.
 COURSE_MAX_DEG = 130.0    # beyond this from the held course the bias falls off
                           # (90 made a 45-deg detour lose half its course pull;
                           # 130 keeps mid-angle headings partially anchored)
+
+# ── wall following (how it stops swivelling beside a wall) ───────────────────
+# Beside a wall the clearance-maximising score and the held course fight every
+# tick: clearance says the heading angled off the wall is always safer, the
+# course says come back, and the winner alternates — the left/right swivel the
+# wall-adjacent probes kept measuring (mean |turn| 0.359 vs 0.194 in the open).
+# A Roomba does neither: it picks a standoff and holds a line parallel to the
+# wall.  So when a side wall is in reach, the wall regulator SUPPLIES the
+# course anchor — "parallel to the wall, at the standoff" — and all the
+# damping already built (COURSE_BIAS, EMA, slew, deadband) shapes the output.
+WALL_RANGE_M   = 0.85     # standoff the follower holds from the wall
+WALL_TILT_GAIN = 1.2      # metres of standoff error per radian of tilt
+                          # (0.45 commanded a 35 deg lurch for 0.28 m of
+                          # error — a lurch is what this replaces; 1.2 keeps
+                          # the whole working range under ~20 deg)
+WALL_TILT_MAX_RAD = math.radians(20)   # cap the parallel-line tilt
+WALL_HOLD_S    = 1.2      # keep following this side this long without a reading
+                          # (sensor holes at a gap shouldn't drop the line
+                          # every second tick)
+WALL_GOAL_MULT = 2.5      # the wall anchor's authority in the score: W_MEM and
+                          # W_LIDAR both prefer headings angled OFF a wall in
+                          # reach, which at the plain goal weight let the robot
+                          # drift out of reach instead of reeling back in.
+                          # The multiplier lets gentle alignment win, while a
+                          # genuinely blocked heading still loses: scan AND
+                          # memory then agree against it and outweigh it.
 
 # ── what the learned map is for ──────────────────────────────────────────────
 # The grid is place-referenced now, which is what makes it worth driving on: a
@@ -147,6 +173,8 @@ class SelfDriver:
         self.last_decision = "off"
         self._heading_smooth = 0.0  # EMA of the chosen heading, in degrees
         self._course_map = None     # map-frame bearing of recent actual travel
+        self._wall_side = 0         # which side is being followed: -1, 0, +1
+        self._wall_until = 0.0      # monotonic time the wall hold expires
         self._course_t = 0.0        # ...and when that was last confirmed
         self._last_course_xy = None # the pose the course was last read from
         self._learned = False       # something new since the last save
@@ -211,6 +239,8 @@ class SelfDriver:
         self.last_decision = "off"
         self._heading_smooth = 0.0
         self._course_map = None
+        self._wall_side = 0
+        self._wall_until = 0.0
         self._stop_evt.set()
         thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
@@ -224,6 +254,8 @@ class SelfDriver:
         self.last_decision = "paused"
         self._heading_smooth = 0.0
         self._course_map = None
+        self._wall_side = 0
+        self._wall_until = 0.0
         if save:
             self.memory.save()
 
@@ -297,6 +329,7 @@ class SelfDriver:
             'map': self.memory.pose_status(),
             'course_deg': (None if self._course_map is None
                            else round(self._course_map, 1)),
+            'wall_side': self._wall_side,   # 0 none, +1 left, -1 right
             'covered_cells': self.memory.covered_cells,
         }
 
@@ -428,6 +461,50 @@ class SelfDriver:
         step = max(-TURN_SLEW_PER_TICK, min(TURN_SLEW_PER_TICK, step))
         return round(self.suggested_turn + step, 4)
 
+    def _wall_course(self, scan):
+        """Map-frame bearing of the wall-parallel line, or None with no wall.
+
+        A P-regulator on the standoff: too close bears away, too far bears in,
+        and a nose angling toward the wall adds its closing component, so the
+        line is caught and levelled instead of overshooting.  The side is held
+        WALL_HOLD_S past the last reading so a gap in the returns does not drop
+        the line every other tick; once expired, either side may pick it up.
+        """
+        now = time.monotonic()
+        if self._wall_side != 0 and now >= self._wall_until:
+            self._wall_side = 0
+        if self._wall_side == 0:
+            left = side_wall(scan.angles, scan.distances, +1)
+            right = side_wall(scan.angles, scan.distances, -1)
+            if left is None and right is None:
+                return None
+            if right is None or (left is not None and left[0] <= right[0]):
+                self._wall_side = +1      # follow the nearer wall
+            else:
+                self._wall_side = -1
+        reading = side_wall(scan.angles, scan.distances, self._wall_side)
+        if reading is not None:
+            self._wall_until = now + WALL_HOLD_S
+            standoff, offset = reading
+        else:
+            standoff, offset = WALL_RANGE_M, 0.0   # gap: hold the line level
+        # Positive err_m means the robot must move TOWARD the wall's standoff
+        # (too far, or the nose is opening away); negative means it is pushing
+        # at the wall (too close, or the nose is closing on it).  The nose term
+        # converts the toward-wall bearing offset into metres at the current
+        # standoff: offset's sign is toward-wall only after the side flip
+        # (left wall nose-in reads offset<0, right wall offset>0), so the
+        # product is side-symmetric.  The response multiplies by the side
+        # again: +tilt steers left, which is away from a right wall and into
+        # a left one — six geometric cases checked (close/far/level-nose,
+        # each side).
+        err_m = (standoff - WALL_RANGE_M) \
+            + 0.5 * self._wall_side * offset * standoff
+        tilt = max(-WALL_TILT_MAX_RAD,
+                   min(WALL_TILT_MAX_RAD,
+                       self._wall_side * err_m / WALL_TILT_GAIN))
+        return math.degrees(self.memory.pose[2] + tilt) % 360.0
+
     def _choose_heading(self, scan):
         """Pick the heading to suggest — the one place heading policy lives."""
         target, policy = self.target, self.policy
@@ -436,6 +513,10 @@ class SelfDriver:
         self.halt = False
 
         best, best_score = 0.0, float('-inf')
+        # The wall anchor is read once per tick (it mutates hold state), then
+        # captured read-only by the scorer below.
+        wall_course = self._wall_course(scan)
+        wall_mult = WALL_GOAL_MULT if wall_course is not None else 1.0
 
         def score_heading(heading, map_veto):
             """This heading's score, or None when something in the way refuses it."""
@@ -464,8 +545,17 @@ class SelfDriver:
                 # open room gets covered instead of patrolled in circles.  The
                 # course is a map-frame bearing; it is re-expressed against the
                 # robot's current heading here, so a pivot rotates what "back
-                # on course" means instead of freezing it.
-                course = self._course_map
+                # on course" means instead of freezing it.  When a side wall
+                # is in reach the wall-parallel line REPLACES the driven
+                # course as the anchor — re-derived from the live scan every
+                # tick, so odometry drift never bends it.  Its goal weight is
+                # raised (wall_mult): the plain weight let W_LIDAR and W_MEM's
+                # preference for headings angled off the wall win and the
+                # robot drift out of the wall's reach instead of reeling back
+                # to its standoff.
+                course = wall_course
+                if course is None:
+                    course = self._course_map
                 if course is not None:
                     course = (course - math.degrees(self.memory.pose[2])
                               + 180.0) % 360.0 - 180.0
@@ -481,7 +571,8 @@ class SelfDriver:
                                     + W_NOVEL / W_GOAL * novel, W_GOAL)
             else:
                 goal, weight = goal_term
-            return (W_LIDAR * lidar_clear + W_MEM * mem_clear + weight * goal)
+            return (W_LIDAR * lidar_clear + W_MEM * mem_clear
+                    + wall_mult * weight * goal)
 
         scores = [(h, score_heading(h, True)) for h in HEADINGS]
         if not pursuing and all(s is None for _, s in scores):

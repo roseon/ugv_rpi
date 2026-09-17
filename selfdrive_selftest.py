@@ -325,7 +325,7 @@ st = drv.status()
 check("keys identical",
       set(st) == {'active', 'suggested_turn', 'front_mm', 'halt', 'wheels',
                   'decision', 'busy_cells', 'free_cells', 'objects', 'scores',
-                  'target', 'map', 'course_deg', 'covered_cells'},
+                  'target', 'map', 'course_deg', 'wall_side', 'covered_cells'},
       sorted(st))
 check("wheels read from the ESP32 frame, forward positive", st['wheels'] ==
       {'odl': 10398.7, 'odr': 9916.4, 'voltage': 11.48})
@@ -1397,6 +1397,111 @@ check("the planner's voltage feed is untouched by the odometry flip",
       guard._wheels.step(volt(guard._base, 11.5)) is None
       and robot_state.wheel_odometry(volt(guard._base, 11.5))['voltage'] == 11.5,
       robot_state.wheel_odometry(volt(guard._base, 11.5)))
+
+# ── 9. wall following: parallel to a near wall, no swivel ────────────────────
+# The complaint this replaces: beside a wall the robot swivelled left/right —
+# clearance vs course fighting every tick.  Now a side wall in reach supplies
+# the course anchor ("parallel at the standoff"), re-derived from the live
+# scan so odometry drift never bends it.
+print("--- 9. wall following ---")
+
+def _tick_with(self, scan_pair):
+    """Re-seat the harness scan pair, then tick the planner once.
+
+    The harness's RL stub froze its scan at construction; this swaps in a new
+    pair so consecutive ticks see the geometry change (approach, settle, open
+    floor) the way the live loop does.
+    """
+    rl = self._base.rl
+    rl.lidar_angles_show = scan_pair[0]
+    rl.lidar_distances_show = scan_pair[1]
+    rl.lidar_scan_time = time.time()
+    self._tick()
+
+SelfDriver._tick_with = _tick_with
+
+
+def wall_scan(nose_deg, standoff_mm, side):
+    """A straight wall at `standoff_mm` abeam, nose angled `nose_deg` (+ = in).
+
+    A straight line at lateral distance r reads, at beam angle β from the
+    nose, a range of r / cos(β) — valid while cos>0 (the wall extends past
+    the beam); beyond the beam the sensor reads open floor (inf, dropped).
+    """
+    beta = side * 90.0 - nose_deg
+    sectors = {}
+    for d in range(-180, 180):
+        c = math.cos(math.radians(side * 90.0 - d))
+        if c > 0.05:
+            sectors[d] = round(standoff_mm / c)
+    return scan(sectors=sectors)
+
+for side, wallname in ((+1, "left"), (-1, "right")):
+    mem_w = spatial_memory.SpatialMemory()
+    drv, _ = planner(mem=mem_w)
+    ticking(drv)
+
+    def settle(drv, pair, n=30):
+        """Tick a fixed geometry to steady state (slew + EMA settled).
+
+        The map is cleared first: these cases teleport the wall (450 mm one
+        case, 1150 the next) while the pose stands still — a place-frame map
+        honestly records that as two parallel walls 700 mm apart, phantom
+        cells a real drive never produces (the odometry moves the pose with
+        the robot, so the wall's cells stay at the wall's one place).
+        """
+        drv.clear_memory()
+        turns = []
+        for _ in range(n):
+            drv._tick_with(pair)
+            turns.append(drv.suggested_turn)
+        return turns
+
+    # (a) level at standoff: the nose aims straight along the wall
+    drv.clear_memory()
+    level = wall_scan(0.0, 700, side)
+    drv._tick_with(level)
+    check("%s wall: level at standoff picks the wall up" % wallname,
+          drv._wall_side == side and abs(drv.suggested_turn) < 0.2,
+          (drv._wall_side, drv.suggested_turn))
+    # (b) too close: steers AWAY from the wall, and small at steady state —
+    # every steady turn must be under the lurch size the probes measured
+    turns = settle(drv, wall_scan(side * 8.0, 450, side))
+    away = turns[-1]
+    check("%s wall too close: steers away, small, steady" % wallname,
+          (away * side) < 0.0 and 0.0 < abs(away) <= 0.35,
+          (wallname, turns[-5:]))
+    check("%s no left/right swivel while following" % wallname,
+          max(abs(t) for t in turns) <= 0.35
+          and all((t < 0) == (away < 0) for t in turns if t != 0.0),
+          (max(abs(t) for t in turns), turns[-8:]))
+    # (c) too far: steers gently IN, small
+    turns = settle(drv, wall_scan(-side * 8.0, 1150, side))
+    inw = turns[-1]
+    check("%s wall too far: steers in, small, steady" % wallname,
+          (inw * side) > 0.0 and abs(inw) <= 0.35,
+          (wallname, turns[-5:], drv._wall_side, drv.last_decision))
+    # (d) nose closing in: caught and levelled before it overshoots
+    turns = settle(drv, wall_scan(side * 12.0, 600, side))
+    catch = turns[-1]
+    check("%s nose closing: caught, small, steady" % wallname,
+          (catch * side) < 0.0 and abs(catch) <= 0.35, (wallname, turns[-5:]))
+    # (e) a gap in the returns: the line is HELD level for WALL_HOLD_S, then
+    # released — neither a drop-every-tick line nor a ghost wall forever
+    gap = wall_scan(side * 8.0, 2000, side)     # wall beyond reach
+    drv._tick_with(gap)
+    check("%s gap: the hold keeps the line level" % wallname,
+          drv._wall_side == side and abs(drv.suggested_turn) < 0.2,
+          (drv._wall_side, drv.suggested_turn))
+    drv._wall_until = time.monotonic() - 0.1    # hold expires
+    drv._tick_with(gap)
+    check("%s gap expired: the anchor drops" % wallname, drv._wall_side == 0,
+          (drv._wall_side, drv.last_decision))
+    # (f) open floor: no wall anchor, ordinary cruise applies
+    settle(drv, scan(front_mm=3000), n=3)
+    check("%s side open: no wall anchor" % wallname, drv._wall_side == 0,
+          (drv._wall_side, drv.last_decision))
+    drv.stop()
 
 print()
 print("RESULT: %d failures" % len(FAILS))
