@@ -165,6 +165,19 @@ public sealed class RobotClient : IAsyncDisposable
     public Task<JsonElement> RetryCameraAsync() => PostFormAsync("/retry_camera", new Dictionary<string, string>());
     public Task<JsonElement> SetAvoidanceAsync(bool on) => PostFormAsync("/lidar_avoidance", new() { ["enable"] = on ? "true" : "false" });
 
+    // The robot's own self-drive and its learned map.  The map lives on the robot
+    // (spatial_memory.py, place-referenced), so the Command Center reads it rather
+    // than keeping a second copy in the robot's instantaneous frame.
+    public Task<JsonElement> SetSelfDriveAsync(bool on) =>
+        PostFormAsync("/selfdrive", new() { ["enable"] = on ? "true" : "false" });
+    public Task<JsonElement> GetSurroundingsAsync() => GetJsonAsync("/surroundings");
+    public Task<JsonElement> GetSelfDriveStatusAsync() => GetJsonAsync("/selfdrive_status");
+    public Task<JsonElement> GetLidarStatusAsync() => GetJsonAsync("/lidar_status");
+    public Task<JsonElement> SaveMapAsync() =>
+        PostFormAsync("/selfdrive_map", new() { ["action"] = "save" });
+    public Task<JsonElement> ClearMapAsync() =>
+        PostFormAsync("/selfdrive_map", new() { ["action"] = "clear" });
+
     // Ollama inference takes seconds (and can be slow on first call), so Lance
     // gets its own client instead of the 6s default used for telemetry.
     readonly HttpClient _lanceHttp = new() { Timeout = TimeSpan.FromSeconds(120) };

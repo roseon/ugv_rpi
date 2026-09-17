@@ -28,34 +28,40 @@
             </StackPanel>
         </Border>
 
-        <!-- autopilot -->
+        <!-- self-driving, on the robot -->
         <Border Style="{StaticResource PanelCard}" Grid.Column="1">
             <StackPanel>
-                <TextBlock Text="② SELF-DRIVING" Style="{StaticResource SectionTitle}"/>
+                <TextBlock Text="② SELF-DRIVING (on the robot)" Style="{StaticResource SectionTitle}"/>
                 <TextBlock Style="{StaticResource HudText}" TextWrapping="Wrap"
-                           Text="Reactive corridor following: scores 13 candidate headings against live lidar + the learned obstacle memory, prefers the goal heading, slows near obstacles."/>
+                           Text="The robot drives itself from its own learned map: 13 candidate headings scored against the live lidar plus remembered occupancy, with a heading into remembered occupation refused before the wheels move. Engage switches on avoidance and self-drive together."/>
                 <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
                     <Button x:Name="GoBtn" Content="🧠 Engage" Style="{StaticResource OpButton}" Click="OnReactive"/>
                     <Button Content="⏹ Stop" Style="{StaticResource OpButton}" Click="OnStopAuto"/>
                 </StackPanel>
-                <TextBlock Style="{StaticResource HudText}" Text="Goal heading (°)" Margin="0,10,0,2"/>
-                <Slider x:Name="GoalSlider" Minimum="-90" Maximum="90" Value="0" TickFrequency="15" IsSnapToTickEnabled="True"/>
-                <TextBlock Style="{StaticResource HudText}" Text="Cruise speed" Margin="0,6,0,2"/>
-                <Slider x:Name="CruiseSlider" Minimum="0.15" Maximum="0.6" Value="0.35"/>
-                <TextBlock Style="{StaticResource HudText}" Text="Danger distance (m)" Margin="0,6,0,2"/>
-                <Slider x:Name="DangerSlider" Minimum="0.3" Maximum="1.2" Value="0.55"/>
+                <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                    <Button x:Name="AvoidBtn" Content="🛡 Avoidance: ?" Style="{StaticResource OpButton}" Click="OnToggleAvoidance"/>
+                </StackPanel>
+                <TextBlock Style="{StaticResource HudText}" Text="Robot's own decision" Margin="0,10,0,2"/>
                 <TextBlock x:Name="DecisionText" Style="{StaticResource HudValue}" TextWrapping="Wrap" Text="—" Margin="0,10,0,0"/>
+                <TextBlock x:Name="RobotStateText" Style="{StaticResource HudText}" TextWrapping="Wrap" Text="—" Margin="0,8,0,0"/>
             </StackPanel>
         </Border>
 
-        <!-- learned memory -->
+        <!-- learned memory, as the robot holds it -->
         <Border Style="{StaticResource PanelCard}" Grid.Column="2">
             <StackPanel>
-                <TextBlock Text="③ LEARNED OBSTACLE MAP" Style="{StaticResource SectionTitle}"/>
-                <Border Background="#FF0D0F12" CornerRadius="6" ClipToBounds="True" Height="240">
+                <TextBlock Text="③ LEARNED MAP (on the robot)" Style="{StaticResource SectionTitle}"/>
+                <TextBlock Style="{StaticResource HudText}" TextWrapping="Wrap"
+                           Text="The robot's own map, in places: it keeps learning whenever the app is running — including while avoidance is on and you are driving by hand — and the robot is drawn where the map says it is."/>
+                <Border Background="#FF0D0F12" CornerRadius="6" ClipToBounds="True" Height="240" Margin="0,8,0,0">
                     <Canvas x:Name="MemCanvas"/>
                 </Border>
-                <TextBlock x:Name="MemInfo" Style="{StaticResource HudText}" Text="0 cells learned" Margin="0,8,0,0"/>
+                <TextBlock x:Name="MemInfo" Style="{StaticResource HudText}" Text="0 cells remembered" Margin="0,8,0,0"/>
+                <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                    <Button Content="💾 Save map" Style="{StaticResource OpButton}" Click="OnSaveMap"/>
+                    <Button Content="🗑 Clear map" Style="{StaticResource OpButton}" Click="OnClearMap"/>
+                </StackPanel>
+
                 <TextBlock Text="④ FOLLOW OBJECT (CV)" Style="{StaticResource SectionTitle}" Margin="0,12,0,0"/>
                 <TextBlock Style="{StaticResource HudText}" Text="Target hue (0=red, 60=yellow, 120=green, 240=blue)"/>
                 <Slider x:Name="HueSlider" Minimum="0" Maximum="360" Value="0"/>
