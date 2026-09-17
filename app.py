@@ -435,7 +435,13 @@ def _battery_tick():
     the robot drive away again at 9.1 V — which is exactly what happened
     on the first live trip.  Announcing stays once per latch.
     """
-    battery_guard.update((base.base_data or {}).get('v'))
+    raw = (base.base_data or {}).get('v')
+    state = battery_guard.update(raw)
+    if state != _battery_tick._last_log[0] \
+            or time.time() - _battery_tick._last_log[1] > 30:
+        _battery_tick._last_log = [state, time.time()]
+        logging.info("[battery] v=%r state=%s latched=%s", raw, state,
+                     battery_guard.latched)
     if not battery_guard.latched:
         _battery_announced[0] = False
         return
@@ -447,6 +453,8 @@ def _battery_tick():
     cvf.info_update("BATTERY LOW - parked", (255, 64, 0), 4.0)
     threading.Thread(target=voice.speak, args=(battery_guard_announce(),),
                      daemon=True).start()
+
+_battery_tick._last_log = [None, 0.0]   # (last state, last log time)
 # Self-driving planner: learns surroundings (lidar grid + camera objects) and
 # steers the avoider's cruise toward safe headings. Started idle at boot.
 self_driver = self_drive.SelfDriver(
@@ -1032,7 +1040,14 @@ def _selfdrive_on():
     self_driver.enable()
 
 def _selfdrive_off():
-    """Stop self-driving: pause the planner and halt the executor's wheels."""
+    """Stop self-driving: pause the planner and halt the executor's wheels.
+
+    The watchdog timestamp is a module global: assigned without `global` here
+    once, the statement created a throwaway local, the auto-resume watchdog
+    kept its stale timestamp and re-armed the drive it was meant to stand
+    down — measured live as 4.8 m of uncommanded cruise after a park.
+    """
+    global _last_manual_cmd_time
     self_driver.disable()
     avoider.pause(halt=True)
     _last_manual_cmd_time = 0.0

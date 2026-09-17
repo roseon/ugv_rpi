@@ -1054,3 +1054,38 @@ become an enforce-once flag — it stayed silent while the robot drove
 away at 9.1 V.  The guard now re-asserts its park on every tick while
 latched, the watchdog stands down while latched, and announcing stays
 once per latch.  Deployed; robot parked at 9.77 V resting.
+
+## The wall-adjacent lurch was the map's veto, not flicker (Sep 17, evening)
+
+A 5 Hz probe of a wall-adjacent drive (389 samples) split the complaint
+in two: steering sign changed in only ~10% of samples — the EMA, slew
+cap and deadband were already doing their job — while mean |turn| near
+walls ran 0.359 vs 0.194 in the open, with +80..110 deg headings winning
+while the front cone was clean.  The lurch was the memory:
+MEM_BLOCK_CLEAR refused a heading on remembered wall-edges alone, so the
+planner threw the robot at far-side gaps the live scan showed clear,
+then corrected back — the "shifting left and right like crazy".
+
+The veto now fires only when the live scan also refuses the heading;
+otherwise the remembered obstacle steers by score (the blocked heading
+ranks last).  With COURSE_BIAS 1.0 -> 1.8 and COURSE_MAX_DEG 90 -> 130,
+the same 120 s acceptance moved straight-while-clear 47% -> 58%
+(median clear-path turn 0.08 when it cruises) and coverage 21 -> 616
+cells, peak 699 — best yet — with zero battery events (min 9.89 V).
+The residual wide turns are -110 deg emergency pivots with the bumper
+threatened: the avoidance layer's job, not course-keeping's.
+
+## The park that did not hold: a missing `global` (Sep 17, evening)
+
+The tuned run parked normally — and 4.79 m later the robot was still
+cruising.  _selfdrive_off assigned _last_manual_cmd_time without a
+`global` declaration: Python created a throwaway local, the module-level
+watchdog timestamp kept its stale value, and the auto-resume watchdog
+re-armed the drive the park was meant to end.  (Every earlier proof held
+because the check window closed before the watchdog tick.)  Fixed at the
+one line; proven live: 8 s drive, disable, worst odom delta across the
+full 30 s watchdog window 0.185 m — coast-down, not cruise — then parked
+solid through a 60 s watch.  The battery guard now also logs every state
+change and a 30 s heartbeat (`[battery] v=... state=... latched=...`),
+because a guard whose state is invisible reads as a guard that never
+fired.
